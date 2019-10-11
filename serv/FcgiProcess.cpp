@@ -1,12 +1,14 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include "FcgiProcess.h"
 #include "event.h"
 #include "mutex.h"
-#include "FcgiProcess.h"
+#include "socket.h"
 #include "thread.h"
 #include <deque>
 #include <vector>
+
 
 #define FAILED_(S) throw std::string(S)
 
@@ -229,7 +231,12 @@ bool FcgiSocketIO::connect()
 		addr.sin_port = htons(port);
 		m->sock_io = socket(AF_INET, SOCK_STREAM, 0);
 		int r = ::connect(m->sock_io, (sockaddr *)&addr, sizeof(addr));
-		return r == 0;
+		if (r != 0) {
+			closesocket(m->sock_io);
+			m->sock_io = -1;
+			return false;
+		}
+		return true;
 	}
 }
 

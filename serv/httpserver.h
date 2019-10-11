@@ -48,7 +48,7 @@ struct http_request_t {
 	std::vector<std::string> header;
 	SocketBuffer *sockbuff;
 
-	std::string get(std::string const &name) const;
+	std::string headerValue(std::string const &name) const;
 
 	void read_content(std::vector<char> *out, int maxlen);
 
@@ -66,14 +66,18 @@ struct RequestHandler {
 
 class HTTP_Server;
 
+enum class ConnectionType {
+	Close,
+	KeepAlive,
+	UpgradeWebSocket,
+};
+
 class http_response_t {
 public:
 	std::vector<char> content;
-	bool keepalive;
-	http_response_t()
-	{
-		keepalive = false;
-	}
+
+	ConnectionType keepalive = ConnectionType::Close;
+
 	void print(char const *begin, char const *end)
 	{
 		content.insert(content.end(), begin, end);

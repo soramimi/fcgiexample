@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <vector>
+#include "base64.h"
+#include "sha1.h"
 
 #ifdef _WIN32
 #include <mbctype.h>
@@ -67,13 +69,13 @@ private:
 
 	int get_content_length(http_request_t const *request) const
 	{
-		return strtol(request->get("Content-Length").c_str(), 0, 10);
+		return strtol(request->headerValue("Content-Length").c_str(), 0, 10);
 	}
 
 	void parse_content_type(http_request_t const *request, ContentType *out) const
 	{
 		*out = ContentType();
-		std::string contype = request->get("Content-Type");
+		std::string contype = request->headerValue("Content-Type");
 		char const *begin = contype.c_str();
 		char const *end = begin + contype.size();
 		std::vector<std::string> vec;
@@ -389,7 +391,9 @@ public:
 #endif
 					proc->launch(cmd);
 				}
-				proc->connect();
+				if (!proc->connect()) {
+					return http_503_service_unavailable;
+				}
 
 				uint16_t reqid = 1;
 				
@@ -512,6 +516,33 @@ public:
 #endif
 				}
 				return http_200_ok;
+			}
+		} else if (location == "/hello/") {
+			response->print("Content-Type: text/plain\r\n");
+			response->print("Connection: close\r\n");
+			response->print("\r\n");
+			response->print("Hello, world\r\n");
+			return http_200_ok;
+		} else if (location == "/sock/") {
+			std::string sec = request->headerValue("Sec-WebSocket-Key");
+			if (!sec.empty()) {
+				sec += "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+				{
+					std::vector<char> h;
+					uint8_t hash[20];
+					SHA1Context c;
+					SHA1Reset(&c);
+					SHA1Input(&c, (uint8_t const *)sec.c_str(), sec.size());
+					SHA1Result(&c, hash);
+					base64_encode((char const *)hash, 20, &h);
+					sec.assign(h.data(), h.size());
+				}
+				response->print("Upgrade: websocket\r\n");
+				response->print("Connection: upgrade\r\n");
+				response->print("Sec-WebSocket-Accept: " + sec + "\r\n");
+				response->print("\r\n");
+				response->keepalive = ConnectionType::UpgradeWebSocket;
+				return http_101_switching_protocols;
 			}
 		}
 

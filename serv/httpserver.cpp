@@ -183,6 +183,20 @@ struct HTTP_Server::Private {
 	RequestHandlerMap request_handler_map;
 };
 
+class WebSocketThread : public Thread {
+public:
+	int sock = -1;
+	virtual void run()
+	{
+		while (true) {
+			char buf[65536];
+			int n = read(sock, buf, sizeof(buf));
+			if (n < 1) break;
+			printf("%d\n", n);
+		}
+	}
+};
+
 class HTTP_Thread : public Thread {
 public:
 	HTTP_Server *server;
@@ -194,7 +208,7 @@ public:
 	virtual void run()
 	{
 		try {
-			while (true) {
+			while (1) {
 				struct sockaddr_in peer_sin;
 
 				socklen_t len = sizeof(peer_sin);
@@ -244,18 +258,79 @@ public:
 								sprintf(tmp, "Content-Length: %u", len);
 								header.push_back(tmp);
 							}
-							if (response.keepalive) {
+							if (response.keepalive == ConnectionType::KeepAlive) {
 								header.push_back("Connection: keep-alive");
 							}
 							server->http_send_response_header(sockbuff.sock, status, header);
 							send(sockbuff.sock, ptr, len);
 						}
-						if (!response.keepalive) {
+
+						// wip: websocket
+						if (status == http_101_switching_protocols && response.keepalive == ConnectionType::UpgradeWebSocket) {
+							while (1) {
+								std::vector<char> message;
+								char buf[65536];
+								char maskkey[4];
+								int n = read(connected_socket, buf, sizeof(buf));
+								if (n < 1) break;
+								if (n >= 2) {
+									int opcode = buf[0] & 0x0f;
+									bool masked = buf[1] & 0x80;
+									int payloadlen = buf[1] & 0x7f;
+									int i = 2;
+									if (payloadlen == 126) {
+									} else if (payloadlen == 127) {
+									}
+									if (masked) {
+										if (i + 4 >= n) break;
+										memcpy(maskkey, buf + i, 4);
+										i += 4;
+									} else {
+										memset(maskkey, 0, 4);
+									}
+									while (payloadlen > 0) {
+										int l = std::min(n - i, payloadlen);
+										for (int j = 0; j < l; j++) {
+											buf[i + j] ^= maskkey[j & 3];
+										}
+										message.insert(message.end(), buf + i, buf + i + l);
+										payloadlen -= l;
+									}
+									std::string m(message.data(), message.size());
+									printf("%d %s\n", message.size(), m.c_str());
+									if (m == "hello") {
+										int n = 5;
+										char const *data = "world";
+										int i = 0;
+										maskkey[0] = rand();
+										maskkey[1] = rand();
+										maskkey[2] = rand();
+										maskkey[3] = rand();
+										buf[0] = 0x81;
+										buf[1] = 0x80 + n;
+										i = 2;
+										memcpy(buf + i, maskkey, 4);
+										i += 4;
+										for (int j = 0; j < n; j++) {
+											buf[i + j] = data[j] ^ maskkey[j & 3];
+										}
+										i += n;
+										send(connected_socket, buf, i);
+									}
+									if (opcode == 8) {
+										goto disconnect;
+										return;
+									}
+								}
+							}
+							return;
+						}
+						if (response.keepalive != ConnectionType::KeepAlive) {
 							break;
 						}
 					}
 				}
-
+disconnect:;
 				closesocket(connected_socket);
 			}
 		} catch (char const *) {
@@ -318,7 +393,7 @@ http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http
 	if (first.size() < 3) {
 		return http_400_bad_request;
 	}
-	response->keepalive = false;
+	response->keepalive = ConnectionType::Close;
 	request->protocol_version.major = 1;
 	request->protocol_version.minor = 0;
 	{
@@ -331,18 +406,18 @@ http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http
 					request->protocol_version.major = major;
 					request->protocol_version.minor = minor;
 					if (major >= 1 && minor >= 1) {
-						response->keepalive = true;
+						response->keepalive = ConnectionType::KeepAlive;
 					}
 				}
 			}
 		}
 	}
 	{
-		std::string s = request->get("Connection");
+		std::string s = request->headerValue("Connection");
 		if (stricmp(s.c_str(), "close") == 0) {
-			response->keepalive = false;
+			response->keepalive = ConnectionType::Close;
 		} else if (stricmp(s.c_str(), "keep-alive") == 0) {
-			response->keepalive = true;
+			response->keepalive = ConnectionType::KeepAlive;
 		}
 	}
 	if (!m->http_handler) {
@@ -456,7 +531,7 @@ bool HTTP_Server::run()
 
 //
 
-std::string http_request_t::get(const std::string &name) const
+std::string http_request_t::headerValue(const std::string &name) const
 {
 	for (std::vector<std::string>::const_iterator it = header.begin(); it != header.end(); it++) {
 		if (strnicmp(it->c_str(), name.c_str(), name.size()) == 0 && it->c_str()[name.size()] == ':') {
