@@ -6,7 +6,7 @@ struct http_status_t {
 	char const *text;
 };
 
-#define HTTP_STATUS(CODE, KEY, TEXT) extern http_status_t http_##CODE##KEY[1];
+#define HTTP_STATUS(CODE, KEY, TEXT) extern http_status_t http##CODE##KEY[1];
 #include "httpstatus.txt"
 #undef HTTP_STATUS
 

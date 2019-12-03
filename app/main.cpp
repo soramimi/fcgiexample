@@ -1,6 +1,6 @@
 
 #include "myfcgi.h"
-
+#include <unistd.h>
 #include <string.h>
 #include <string>
 #include <time.h>
@@ -60,6 +60,16 @@ int main(int argc, char **argv)
 			char const *s = asctime(t);
 			Write(s, strlen(s));
 			Write("\r\n", 2);
+		}
+		Write("\r\n", 2);
+		char **e = fcgi_environ ? fcgi_environ : environ;
+		if (e) {
+			while (*e) {
+				std::string s = *e;
+				s += "\r\n";
+				Write(s.c_str(), s.size());
+				e++;
+			}
 		}
 	}
 

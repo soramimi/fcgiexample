@@ -28,6 +28,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include "misc.h"
 
 std::string SocketBuffer::readline()
 {
@@ -234,19 +235,69 @@ public:
 						request.header.push_back(line);
 					}
 					if (request.header.size() > 0) {
+						http_status_t const *status = nullptr;
 						http_response_t response;
-						http_status_t const *status = server->http_process_request(this, &request, &response);
+						if (!request.header.empty()) {
+							std::vector<std::string> first;
+							misc::split_words_by_space(request.header.front(), &first);
+							if (first.size() < 3) {
+								status = http400_bad_request;
+							} else {
+								if (first[0] == "GET") {
+									request.method = RequestMethod::GET;
+								} else if (first[0] == "POST") {
+									request.method = RequestMethod::POST;
+								}
+								request.uri = first[1];
+								std::vector<std::string> prot;
+								misc::split_words(first[2], '/', &prot);
+								if (prot.size() == 2) {
+									request.protocol = prot[0];
+									if (request.protocol == "HTTP") {
+										int maj, min;
+										if (sscanf(prot[1].c_str(), "%u.%u", &maj, &min) == 2) {
+											request.protocol_version.maj = maj;
+											request.protocol_version.min = min;
+											if (maj >= 1 && min >= 1) {
+												response.keepalive = ConnectionType::KeepAlive;
+											}
+										}
+										request.scheme = "http";
+									}
+								}
+								request.header.erase(request.header.begin());
+								{
+									std::string s = request.header_value("Connection");
+									if (stricmp(s.c_str(), "close") == 0) {
+										response.keepalive = ConnectionType::Close;
+									} else if (stricmp(s.c_str(), "keep-alive") == 0) {
+										response.keepalive = ConnectionType::KeepAlive;
+									}
+								}
+								{
+									std::string s = request.header_value("Content-Length");
+									request.content_length = strtol(s.c_str(), nullptr, 10);
+								}
+							}
+						}
+						if (!status) {
+							HTTPIO *io = &response;
+							status = server->http_process_request(this, &request, &response, io);
+							if (!status) {
+								status = http500_internal_server_error;
+							}
+						}
 						if (status->code / 100 >= 4) {
 							if (response.content.empty()) {
-								response.print("Content-Type: text/plain\r\n\r\n");
+								response.write("Content-Type: text/plain\r\n\r\n");
 								char tmp[10];
 								sprintf(tmp, "%u ", status->code);
-								response.print(tmp);
-								response.print(status->text);
+								response.write(tmp);
+								response.write(status->text);
 							}
 						}
 						if (response.content.empty()) {
-							status = http_204_no_content;
+							status = http204_no_content;
 						} else {
 							std::vector<std::string> header;
 							char const *begin = &response.content[0];
@@ -266,7 +317,7 @@ public:
 						}
 
 						// wip: websocket
-						if (status == http_101_switching_protocols && response.keepalive == ConnectionType::UpgradeWebSocket) {
+						if (status == http101_switching_protocols && response.keepalive == ConnectionType::UpgradeWebSocket) {
 							while (1) {
 								std::vector<char> message;
 								char buf[65536];
@@ -331,6 +382,7 @@ public:
 					}
 				}
 disconnect:;
+				shutdown(connected_socket, SHUT_RDWR);
 				closesocket(connected_socket);
 			}
 		} catch (char const *) {
@@ -385,60 +437,23 @@ static std::string make_location(std::string const &url)
 {
 	return "Location: " + url;
 }
-
-http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http_request_t *request, http_response_t *response)
+http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http_request_t *request, http_response_t *response, HTTPIO *io)
 {
-	std::vector<std::string> first;
-	misc::split_words_by_space(request->header[0], &first);
-	if (first.size() < 3) {
-		return http_400_bad_request;
-	}
-	response->keepalive = ConnectionType::Close;
-	request->protocol_version.major = 1;
-	request->protocol_version.minor = 0;
-	{
-		std::vector<std::string> prot;
-		misc::split_words(request->header[0], '/', &prot);
-		if (prot.size() == 2) {
-			if (prot[0] == "HTTP") {
-				int major, minor;
-				if (sscanf(prot[0].c_str(), "%u.%u", &major, &minor) == 2) {
-					request->protocol_version.major = major;
-					request->protocol_version.minor = minor;
-					if (major >= 1 && minor >= 1) {
-						response->keepalive = ConnectionType::KeepAlive;
-					}
-				}
-			}
-		}
-	}
-	{
-		std::string s = request->headerValue("Connection");
-		if (stricmp(s.c_str(), "close") == 0) {
-			response->keepalive = ConnectionType::Close;
-		} else if (stricmp(s.c_str(), "keep-alive") == 0) {
-			response->keepalive = ConnectionType::KeepAlive;
-		}
+	for (std::string const &line : request->header) {
+		fprintf(stderr, "%s\n", line.c_str());
 	}
 	if (!m->http_handler) {
-		return http_503_service_unavailable;
+		return http503_service_unavailable;
 	}
-	request->method = (Method)-1;
-	if (first[0] == "GET") {
-		request->method = HTTP_GET;
-	} else if (first[0] == "POST") {
-		request->method = HTTP_POST;
-	}
-	if (request->method == HTTP_GET || request->method == HTTP_POST) {
-		std::string url = first[1];
-		if (!validate_url(url)) {
-			return http_400_bad_request;
+	if (request->method == RequestMethod::GET || request->method == RequestMethod::POST) {
+		if (!validate_url(request->uri)) {
+			return http400_bad_request;
 		}
 		response->content.clear();
 		response->content.reserve(65536);
-		return m->http_handler->do_get(this, url, request, response);
+		return m->http_handler->do_get(this, request->uri, request, response, io);
 	}
-	return http_405_method_not_allowed;
+	return http405_method_not_allowed;
 }
 
 void HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &header)
@@ -514,6 +529,7 @@ bool HTTP_Server::run()
 #endif
 		}
 
+		shutdown(m->listening_socket, SHUT_RDWR);
 		ret = closesocket(m->listening_socket);
 		if (ret == -1) {
 			throw std::string("close");
@@ -531,7 +547,7 @@ bool HTTP_Server::run()
 
 //
 
-std::string http_request_t::headerValue(const std::string &name) const
+std::string http_request_t::header_value(const std::string &name) const
 {
 	for (std::vector<std::string>::const_iterator it = header.begin(); it != header.end(); it++) {
 		if (strnicmp(it->c_str(), name.c_str(), name.size()) == 0 && it->c_str()[name.size()] == ':') {

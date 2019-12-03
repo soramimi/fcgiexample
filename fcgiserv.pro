@@ -31,6 +31,7 @@ HEADERS += \
     serv/event.h \
     serv/mutex.h \
     serv/FcgiProcess.h \
+	serv/strformat.h \
     serv/thread.h \
 	serv/debug.h \
     serv/joinpath.h
