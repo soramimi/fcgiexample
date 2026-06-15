@@ -51,14 +51,14 @@ enum class RequestMethod {
 
 struct http_request_t {
 	std::vector<std::string> header;
-	SocketBuffer *sockbuff;
+	SocketBuffer *sockbuff = nullptr;
 
 	std::string header_value(std::string const &name) const;
 
 	void read_content(std::vector<char> *out, int maxlen);
 
 	std::string protocol;
-	RequestMethod method;
+	RequestMethod method = RequestMethod::INVALID;
 	struct {
 		int maj = 0;
 		int min = 0;
@@ -66,6 +66,7 @@ struct http_request_t {
 	std::string uri;
 	std::string scheme;
 	unsigned int content_length = 0;
+	bool content_consumed = false;
 };
 
 struct RequestHandler {
@@ -140,7 +141,7 @@ public:
 	void setPort(int port);
 
 	http_status_t const *http_process_request(HTTP_Thread *thread, http_request_t *request, http_response_t *response, HTTPIO *io);
-	void http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &response);
+	bool http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &response);
 
 	bool run();
 };

@@ -164,18 +164,17 @@ static char const *parse_header(char const *begin, char const *end, std::vector<
 
 // HTTP_Server
 
-int send(socket_t sock, char const *ptr, int len)
+static bool send_all(socket_t sock, char const *ptr, int len)
 {
-	char const *begin = ptr;
 	char const *end = ptr + len;
 	while (ptr < end) {
 		int n = end - ptr;
 		n = std::min(n, 65536);
 		n = ::send(sock, ptr, n, 0);
-		if (n < 1) break;
+		if (n < 1) return false;
 		ptr += n;
 	}
-	return ptr - begin;
+	return ptr == end;
 }
 
 //
@@ -197,6 +196,126 @@ public:
 		return it->second;
 	}
 };
+
+namespace {
+
+constexpr size_t MAX_WEBSOCKET_MESSAGE_SIZE = 1024 * 1024; // 1MiB
+
+class WebSocket {
+public:
+	struct Message {
+		int opcode;
+		std::vector<char> payload;
+	};
+private:
+	std::vector<unsigned char> buffer;
+	std::vector<char> current_message;
+	int message_opcode = 0;
+	bool closing = false;
+
+	bool unmask_and_append(unsigned char const *payload, uint64_t payload_length, unsigned char const *mask_key)
+	{
+		if (payload_length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+			return false;
+		}
+		size_t len = static_cast<size_t>(payload_length);
+		if (current_message.size() + len > MAX_WEBSOCKET_MESSAGE_SIZE) {
+			return false;
+		}
+		size_t base = current_message.size();
+		current_message.resize(base + len);
+		for (size_t j = 0; j < len; j++) {
+			current_message[base + j] = payload[j] ^ mask_key[j & 3];
+		}
+		return true;
+	}
+public:
+	bool feed(const char *data, int len, std::vector<Message> *out)
+	{
+		if (closing) return false;
+		buffer.insert(buffer.end(), reinterpret_cast<unsigned char const *>(data), reinterpret_cast<unsigned char const *>(data) + len);
+		while (true) {
+			if (buffer.size() < 2) return true;
+			unsigned char const *p = buffer.data();
+			bool fin = (p[0] & 0x80) != 0;
+			int rsv = (p[0] >> 4) & 0x07;
+			int opcode = p[0] & 0x0f;
+			bool masked = (p[1] & 0x80) != 0;
+			uint64_t payload_length = p[1] & 0x7f;
+			size_t i = 2;
+			if (rsv != 0) return false;
+			if (!masked) return false;
+			if (payload_length == 126) {
+				if (buffer.size() < i + 2) return true;
+				payload_length = (static_cast<uint64_t>(p[i]) << 8) | p[i + 1];
+				i += 2;
+			} else if (payload_length == 127) {
+				if (buffer.size() < i + 8) return true;
+				payload_length = 0;
+				for (int j = 0; j < 8; j++) {
+					payload_length = (payload_length << 8) | p[i + j];
+				}
+				i += 8;
+				if (payload_length > MAX_WEBSOCKET_MESSAGE_SIZE) return false;
+			}
+			if (buffer.size() < i + 4) return true;
+			unsigned char mask_key[4];
+			memcpy(mask_key, p + i, 4);
+			i += 4;
+			if (buffer.size() < i + payload_length) return true;
+			unsigned char const *payload = p + i;
+			if (opcode == 0x8) { // close
+				closing = true;
+				return false;
+			} else if (opcode == 0x9) { // ping
+				out->push_back(Message());
+				out->back().opcode = 0xa; // pong
+				out->back().payload.assign(payload, payload + payload_length);
+			} else if (opcode == 0xa) { // pong
+				// ignore
+			} else if (opcode == 0x0 || opcode == 0x1 || opcode == 0x2) {
+				if (opcode != 0x0) {
+					if (!current_message.empty()) return false;
+					message_opcode = opcode;
+				}
+				if (!unmask_and_append(payload, payload_length, mask_key)) {
+					return false;
+				}
+				if (fin) {
+					out->push_back(Message());
+					out->back().opcode = message_opcode;
+					out->back().payload.swap(current_message);
+					message_opcode = 0;
+				}
+			} else {
+				return false;
+			}
+			buffer.erase(buffer.begin(), buffer.begin() + i + static_cast<size_t>(payload_length));
+		}
+	}
+
+	static std::vector<unsigned char> make_frame(int opcode, const char *data, size_t len)
+	{
+		std::vector<unsigned char> frame;
+		frame.push_back(static_cast<unsigned char>(0x80 | (opcode & 0x0f)));
+		if (len < 126) {
+			frame.push_back(static_cast<unsigned char>(len));
+		} else if (len <= 0xffff) {
+			frame.push_back(126);
+			frame.push_back(static_cast<unsigned char>(len >> 8));
+			frame.push_back(static_cast<unsigned char>(len));
+		} else {
+			frame.push_back(127);
+			for (int i = 7; i >= 0; i--) {
+				frame.push_back(static_cast<unsigned char>((len >> (i * 8)) & 0xff));
+			}
+		}
+		frame.insert(frame.end(), data, data + len);
+		return frame;
+	}
+};
+
+} // namespace
 
 struct HTTP_Server::Private {
 	int tcp_port;
@@ -355,76 +474,59 @@ public:
 							if (response.keepalive == ConnectionType::KeepAlive) {
 								header.push_back("Connection: keep-alive");
 							}
-							server->http_send_response_header(sockbuff.sock, status, header);
-							send(sockbuff.sock, ptr, len);
+							if (!server->http_send_response_header(sockbuff.sock, status, header)) {
+								sockbuff.connected = false;
+							} else if (!send_all(sockbuff.sock, ptr, len)) {
+								sockbuff.connected = false;
+							}
 						}
 
-						// wip: websocket
+						// websocket
 						if (status == http101_switching_protocols && response.keepalive == ConnectionType::UpgradeWebSocket) {
-							while (1) {
-								std::vector<char> message;
+							WebSocket ws;
+							while (sockbuff.connected) {
 								char buf[65536];
-								char maskkey[4];
 								int n = read(connected_socket, buf, sizeof(buf));
 								if (n < 1) break;
-								if (n >= 2) {
-									int opcode = buf[0] & 0x0f;
-									bool masked = buf[1] & 0x80;
-									int payloadlen = buf[1] & 0x7f;
-									int i = 2;
-									if (payloadlen == 126 || payloadlen == 127) {
-										// extended payload length not supported
+								std::vector<WebSocket::Message> messages;
+								if (!ws.feed(buf, n, &messages)) {
+									break;
+								}
+							for (WebSocket::Message const &msg : messages) {
+								if (msg.opcode == 0x9) { // ping
+									auto frame = WebSocket::make_frame(0xa, msg.payload.data(), msg.payload.size());
+									if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
 										goto disconnect;
 									}
-									if (masked) {
-										if (i + 4 > n) break;
-										memcpy(maskkey, buf + i, 4);
-										i += 4;
-									} else {
-										memset(maskkey, 0, 4);
-									}
-									while (payloadlen > 0) {
-										if (i >= n) break;
-										int l = std::min(n - i, payloadlen);
-										if (i + l > n) break;
-										for (int j = 0; j < l; j++) {
-											buf[i + j] ^= maskkey[j & 3];
-										}
-										message.insert(message.end(), buf + i, buf + i + l);
-										payloadlen -= l;
-										i += l;
-									}
-									if (payloadlen > 0) {
-										break; // incomplete frame
-									}
-									std::string m(message.data(), message.size());
-									printf("%d %s\n", (int)message.size(), m.c_str());
+								} else if (msg.opcode == 0xa) { // pong
+									// ignore
+								} else if (msg.opcode == 0x1 || msg.opcode == 0x2) {
+									std::string m(msg.payload.data(), msg.payload.size());
+									printf("%d %s\n", (int)msg.payload.size(), m.c_str());
 									if (m == "hello") {
-										int outlen = 5;
-										char const *data = "world";
-										int i = 0;
-										maskkey[0] = rand();
-										maskkey[1] = rand();
-										maskkey[2] = rand();
-										maskkey[3] = rand();
-										if (2 + 4 + outlen > (int)sizeof(buf)) break;
-										buf[0] = 0x81;
-										buf[1] = 0x80 + outlen;
-										i = 2;
-										memcpy(buf + i, maskkey, 4);
-										i += 4;
-										for (int j = 0; j < outlen; j++) {
-											buf[i + j] = data[j] ^ maskkey[j & 3];
+										std::string reply = "world";
+										auto frame = WebSocket::make_frame(0x1, reply.data(), reply.size());
+										if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
+											goto disconnect;
 										}
-										i += outlen;
-										send(connected_socket, buf, i);
-									}
-									if (opcode == 8) {
-										goto disconnect;
 									}
 								}
 							}
+							}
 							return;
+						}
+						if (request.content_length > 0 && !request.content_consumed && sockbuff.connected) {
+							std::vector<char> discard;
+							size_t remaining = request.content_length;
+							while (remaining > 0 && sockbuff.connected) {
+								int to_read = static_cast<int>(std::min<size_t>(remaining, 65536));
+								sockbuff.read(&discard, to_read);
+								if (discard.empty()) {
+									sockbuff.connected = false;
+									break;
+								}
+								remaining -= discard.size();
+							}
 						}
 						if (response.keepalive != ConnectionType::KeepAlive) {
 							break;
@@ -508,7 +610,7 @@ http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http
 	return http405_method_not_allowed;
 }
 
-void HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &header)
+bool HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &header)
 {
 	std::vector<unsigned char> out;
 	out.reserve(1024);
@@ -527,7 +629,7 @@ void HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *
 		out.push_back('\r');
 		out.push_back('\n');
 	}
-	send(sock, (char const *)&out[0], out.size());
+	return send_all(sock, (char const *)&out[0], out.size());
 }
 
 bool HTTP_Server::run()
@@ -617,6 +719,10 @@ std::string http_request_t::header_value(const std::string &name) const
 
 void http_request_t::read_content(std::vector<char> *out, int maxlen)
 {
+	if (maxlen < 0) {
+		maxlen = content_length;
+	}
 	sockbuff->read(out, maxlen);
+	content_consumed = true;
 }
 
