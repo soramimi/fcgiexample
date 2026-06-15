@@ -23,8 +23,12 @@ struct SocketBuffer {
 	int length;
 	int offset;
 	bool connected;
+	size_t max_line_length;
+	size_t max_header_total_length;
 
 	SocketBuffer()
+		: max_line_length(8192)
+		, max_header_total_length(65536)
 	{
 		clear();
 	}

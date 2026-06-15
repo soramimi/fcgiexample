@@ -15,11 +15,13 @@
 #define strnicmp(A, B, C) strncasecmp(A, B, C)
 #endif
 
+#include "debug.h"
 #include "httpserver.h"
 #include "joinpath.h"
 #include "misc.h"
 #include "thread.h"
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdio.h>
@@ -30,15 +32,20 @@
 #include <vector>
 #include "misc.h"
 
+namespace {
+constexpr size_t MAX_CONTENT_LENGTH = 8 * 1024 * 1024; // 8MiB
+}
+
 std::string SocketBuffer::readline()
 {
 	if (buffer.empty()) {
 		buffer.resize(1024);
 	}
+	size_t line_start = offset;
 	while (1) {
 		if (offset < length) {
-			unsigned char *left = &buffer[offset];
-			unsigned char *right = (unsigned char *)memchr(left, '\n', length - offset);
+			unsigned char *left = &buffer[line_start];
+			unsigned char *right = (unsigned char *)memchr(&buffer[offset], '\n', length - offset);
 			if (right) {
 				offset = right + 1 - &buffer[0];
 				while (left < right && isspace(right[-1])) {
@@ -46,13 +53,30 @@ std::string SocketBuffer::readline()
 				}
 				return std::string(left, right);
 			}
+			if (static_cast<size_t>(length - line_start) >= max_line_length) {
+				connected = false;
+				return std::string();
+			}
 			int n = length - offset;
-			memmove(&buffer[0], left, n);
+			memmove(&buffer[0], &buffer[offset], n);
 			length = n;
 			offset = 0;
+			line_start = 0;
 		} else {
 			length = 0;
 			offset = 0;
+			line_start = 0;
+		}
+		if (static_cast<size_t>(length) >= buffer.size()) {
+			size_t new_size = buffer.size() * 2;
+			if (new_size > max_line_length) {
+				new_size = max_line_length;
+			}
+			if (new_size <= buffer.size()) {
+				connected = false;
+				return std::string();
+			}
+			buffer.resize(new_size);
 		}
 		int l = ::recv(sock, (char *)&buffer[0] + length, buffer.size() - length, 0);
 		if (l < 1) {
@@ -149,7 +173,6 @@ int send(socket_t sock, char const *ptr, int len)
 		n = std::min(n, 65536);
 		n = ::send(sock, ptr, n, 0);
 		if (n < 1) break;
-		if (ptr + n > end) break;
 		ptr += n;
 	}
 	return ptr - begin;
@@ -226,16 +249,26 @@ public:
 				while (sockbuff.connected) {
 					http_request_t request;
 					request.sockbuff = &sockbuff;
+					http_status_t const *status = nullptr;
+					size_t total_header_size = 0;
 
-					while (1) {
+					while (sockbuff.connected) {
 						std::string line = sockbuff.readline();
 						if (line.empty()) {
+							if (!sockbuff.connected) {
+								status = http400_bad_request;
+							}
+							break;
+						}
+						total_header_size += line.size() + 2; // include \r\n
+						if (total_header_size > sockbuff.max_header_total_length) {
+							status = http400_bad_request;
+							sockbuff.connected = false;
 							break;
 						}
 						request.header.push_back(line);
 					}
-					if (request.header.size() > 0) {
-						http_status_t const *status = nullptr;
+					if ((request.header.size() > 0 || status) && sockbuff.connected) {
 						http_response_t response;
 						if (!request.header.empty()) {
 							std::vector<std::string> first;
@@ -253,11 +286,11 @@ public:
 								misc::split_words(first[2], '/', &prot);
 								if (prot.size() == 2) {
 									request.protocol = prot[0];
-									if (request.protocol == "HTTP") {
-										int maj, min;
-										if (sscanf(prot[1].c_str(), "%u.%u", &maj, &min) == 2) {
-											request.protocol_version.maj = maj;
-											request.protocol_version.min = min;
+											if (request.protocol == "HTTP") {
+												unsigned int maj, min;
+												if (sscanf(prot[1].c_str(), "%u.%u", &maj, &min) == 2) {
+													request.protocol_version.maj = maj;
+													request.protocol_version.min = min;
 											if (maj >= 1 && min >= 1) {
 												response.keepalive = ConnectionType::KeepAlive;
 											}
@@ -276,7 +309,15 @@ public:
 								}
 								{
 									std::string s = request.header_value("Content-Length");
-									request.content_length = strtol(s.c_str(), nullptr, 10);
+									if (!s.empty()) {
+										char *endptr = nullptr;
+										long cl = strtol(s.c_str(), &endptr, 10);
+										if (endptr == s.c_str() || *endptr != '\0' || cl < 0 || static_cast<unsigned long>(cl) > MAX_CONTENT_LENGTH) {
+											status = http413_request_entity_too_large;
+										} else {
+											request.content_length = static_cast<unsigned int>(cl);
+										}
+									}
 								}
 							}
 						}
@@ -297,7 +338,9 @@ public:
 							}
 						}
 						if (response.content.empty()) {
-							status = http204_no_content;
+							if (status->code / 100 < 4) {
+								status = http204_no_content;
+							}
 						} else {
 							std::vector<std::string> header;
 							char const *begin = &response.content[0];
@@ -329,48 +372,55 @@ public:
 									bool masked = buf[1] & 0x80;
 									int payloadlen = buf[1] & 0x7f;
 									int i = 2;
-									if (payloadlen == 126) {
-									} else if (payloadlen == 127) {
+									if (payloadlen == 126 || payloadlen == 127) {
+										// extended payload length not supported
+										goto disconnect;
 									}
 									if (masked) {
-										if (i + 4 >= n) break;
+										if (i + 4 > n) break;
 										memcpy(maskkey, buf + i, 4);
 										i += 4;
 									} else {
 										memset(maskkey, 0, 4);
 									}
 									while (payloadlen > 0) {
+										if (i >= n) break;
 										int l = std::min(n - i, payloadlen);
+										if (i + l > n) break;
 										for (int j = 0; j < l; j++) {
 											buf[i + j] ^= maskkey[j & 3];
 										}
 										message.insert(message.end(), buf + i, buf + i + l);
 										payloadlen -= l;
+										i += l;
+									}
+									if (payloadlen > 0) {
+										break; // incomplete frame
 									}
 									std::string m(message.data(), message.size());
-									printf("%d %s\n", message.size(), m.c_str());
+									printf("%d %s\n", (int)message.size(), m.c_str());
 									if (m == "hello") {
-										int n = 5;
+										int outlen = 5;
 										char const *data = "world";
 										int i = 0;
 										maskkey[0] = rand();
 										maskkey[1] = rand();
 										maskkey[2] = rand();
 										maskkey[3] = rand();
+										if (2 + 4 + outlen > (int)sizeof(buf)) break;
 										buf[0] = 0x81;
-										buf[1] = 0x80 + n;
+										buf[1] = 0x80 + outlen;
 										i = 2;
 										memcpy(buf + i, maskkey, 4);
 										i += 4;
-										for (int j = 0; j < n; j++) {
+										for (int j = 0; j < outlen; j++) {
 											buf[i + j] = data[j] ^ maskkey[j & 3];
 										}
-										i += n;
+										i += outlen;
 										send(connected_socket, buf, i);
 									}
 									if (opcode == 8) {
 										goto disconnect;
-										return;
 									}
 								}
 							}
@@ -385,8 +435,10 @@ disconnect:;
 				shutdown(connected_socket, SHUT_RDWR);
 				closesocket(connected_socket);
 			}
-		} catch (char const *) {
-		} catch (std::string const &) {
+		} catch (char const *e) {
+			printlog(std::string("http thread error: ") + e);
+		} catch (std::string const &e) {
+			printlog(std::string("http thread error: ") + e);
 		}
 	}
 };
@@ -417,17 +469,17 @@ void HTTP_Server::setPort(int port)
 
 static bool validate_url(std::string const &url)
 {
-	char const *p = url.c_str();
-	if (strchr(p, '\\')) {
+	if (url.empty() || url[0] != '/') {
 		return false;
 	}
-	if (strstr(p, "..")) {
+	if (url.find('\\') != std::string::npos) {
 		return false;
 	}
-	if (strstr(p, "//")) {
+	if (url.find("..") != std::string::npos) {
 		return false;
 	}
-	if (strstr(p, "/.")) {
+	std::string normalized;
+	if (!misc::normalize_path(url, &normalized)) {
 		return false;
 	}
 	return true;
@@ -538,7 +590,8 @@ bool HTTP_Server::run()
 		for (int i = 0; i < threadcount; i++) {
 			threads[i].join();
 		}
-	} catch (std::string const &) {
+	} catch (std::string const &e) {
+		printlog(std::string("http server error: ") + e);
 		return false;
 	}
 

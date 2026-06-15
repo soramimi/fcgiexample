@@ -203,6 +203,10 @@ private:
 
 	void setEnvironment(std::vector<NameValue> *list, std::string const &name, std::string const &value)
 	{
+		if (name.find('\r') != std::string::npos || name.find('\n') != std::string::npos ||
+			value.find('\r') != std::string::npos || value.find('\n') != std::string::npos) {
+			return; // prevent header injection
+		}
 		for (size_t i = 0; i < list->size(); i++) {
 			if (name == list->at(i).name()) {
 				list->at(i).setValue(value);
@@ -329,9 +333,9 @@ private:
 #ifdef _WIN32
 		char const *cmd = "C:/develop/tinyfcgi/app/tinyfcgi.exe";
 #else
-//		char const *cmd = "./fcgiapp";
-//		char const *cmd = "unix:/tmp/foo.sock";
-		char const *cmd = "inet:localhost:3000";
+		char const *cmd = "./fcgiapp";
+		// char const *cmd = "unix:/tmp/foo.sock";
+		// char const *cmd = "inet:localhost:3000";
 #endif
 
 		std::string cwd;
@@ -398,28 +402,38 @@ private:
 			};
 			write_fcgi_begin_request(FCGI_RESPONDER);
 
-			auto write_fcgi_params = [&](std::vector<NameValue> const &params){
-				std::vector<char> vec;
-				vec.reserve(1024);
-				vec.resize(sizeof(FCGI_Header));
-				auto append_name_value = [&vec](std::string const &name, std::string const &value){
-					vec.push_back(name.size());
-					vec.push_back(value.size());
-					auto append_string = [&vec](std::string const &s){
-						char const *begin = s.c_str();
-						char const *end = begin + s.size();
-						vec.insert(vec.end(), begin, end);
-
-					};
-					append_string(name);
-					append_string(value);
-				};
-				for (NameValue const &param : params) {
-					append_name_value(param.name(), param.value());
+		auto write_fcgi_params = [&](std::vector<NameValue> const &params){
+			std::vector<char> vec;
+			vec.reserve(1024);
+			vec.resize(sizeof(FCGI_Header));
+			auto append_length = [&vec](size_t len){
+				if (len < 128) {
+					vec.push_back(static_cast<char>(len));
+				} else {
+					vec.push_back(static_cast<char>((len >> 24) | 0x80));
+					vec.push_back(static_cast<char>(len >> 16));
+					vec.push_back(static_cast<char>(len >> 8));
+					vec.push_back(static_cast<char>(len));
 				}
-				make_fcgi_header(&vec, FCGI_PARAMS);
-				proc->write(&vec[0], vec.size());
 			};
+			auto append_name_value = [&vec, &append_length](std::string const &name, std::string const &value){
+				append_length(name.size());
+				append_length(value.size());
+				auto append_string = [&vec](std::string const &s){
+					char const *begin = s.c_str();
+					char const *end = begin + s.size();
+					vec.insert(vec.end(), begin, end);
+
+				};
+				append_string(name);
+				append_string(value);
+			};
+			for (NameValue const &param : params) {
+				append_name_value(param.name(), param.value());
+			}
+			make_fcgi_header(&vec, FCGI_PARAMS);
+			proc->write(&vec[0], vec.size());
+		};
 
 			write_fcgi_params(env);
 			std::vector<NameValue> params;
@@ -433,35 +447,42 @@ private:
 			}
 
 			{
+				std::vector<char> tmp;
+				tmp.reserve(65536 + 256);
 				size_t pos = 0;
 				size_t need = 0;
-				FCGI_Header header;
+				FCGI_Header header = {};
 				uint16_t contentlength = 0;
-				char tmp[65536 + 256];
 				while (1) {
 					if (need == 0) {
 						need = sizeof(FCGI_Header);
 					}
 					while (pos < need) {
-						int n = proc->read(tmp + pos, need - pos);
-						if (n < 0) break;
+						int n = proc->read(&tmp[pos], need - pos);
+						if (n <= 0) {
+							return http502_bad_gateway;
+						}
 						pos += n;
 					}
 					if (pos == sizeof(FCGI_Header)) {
-						memcpy(&header, tmp, sizeof(FCGI_Header));
+						memcpy(&header, tmp.data(), sizeof(FCGI_Header));
 						contentlength = ((uint16_t)header.contentLengthB1 << 8) | header.contentLengthB0;
-						if (header.type == FCGI_STDOUT) {
-							if (contentlength == 0) {
-								pos = 0;
-								need = 0;
-								continue;
-							}
+						if (header.type == FCGI_STDOUT && contentlength == 0) {
+							pos = 0;
+							need = 0;
+							continue;
 						}
 						need = sizeof(FCGI_Header) + contentlength + header.paddingLength;
-					} else if (contentlength > 0 && pos == sizeof(FCGI_Header) + contentlength + header.paddingLength) {
-						char const *p = tmp + sizeof(FCGI_Header);
+						if (need > tmp.size()) {
+							tmp.resize(need);
+						}
+					} else if (pos == need) {
+						char const *p = tmp.data() + sizeof(FCGI_Header);
 						if (header.type == FCGI_STDOUT) {
 							io->write(p, contentlength);
+						} else if (header.type == FCGI_STDERR) {
+							std::string err(p, contentlength);
+							printlog("fcgi stderr: " + err);
 						} else if (header.type == FCGI_END_REQUEST) {
 							if (pos >= sizeof(FCGI_Header) + sizeof(FCGI_EndRequestBody)) {
 								FCGI_EndRequestBody const *h = (FCGI_EndRequestBody const *)&tmp[sizeof(FCGI_Header)];
@@ -476,9 +497,6 @@ private:
 						need = 0;
 						contentlength = 0;
 						continue;
-					}
-					if (need == sizeof(FCGI_Header)) {
-						break;
 					}
 				}
 			}
@@ -511,10 +529,14 @@ public:
 				location.assign(left, right);
 			}
 		}
-		if (location == "/app/") {
+		std::string normalized_location;
+		if (!misc::normalize_path(location, &normalized_location)) {
+			return http400_bad_request;
+		}
+		if (normalized_location == "/app/") {
 			auto p = invoke_fastcgi(request, response, response);
 			return p ? p : http502_bad_gateway;
-		} else if (location == "/hello/") {
+		} else if (normalized_location == "/hello/") {
 			response->write("Content-Type: text/plain\r\n");
 			response->write("Connection: close\r\n");
 			response->write("\r\n");

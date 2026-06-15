@@ -86,3 +86,57 @@ void misc::split_words_by_space(std::string const &str, std::vector<std::string>
 	split_(begin, end, [&](char c){ return isspace(c); }, out);
 }
 
+bool misc::normalize_path(std::string const &input, std::string *out)
+{
+	out->clear();
+	if (input.empty()) return false;
+
+	std::vector<std::string> parts;
+	char const *begin = input.c_str();
+	char const *end = begin + input.size();
+	char const *ptr = begin;
+	char const *left = ptr;
+	while (true) {
+		int c = 0;
+		if (ptr < end) {
+			c = *ptr & 0xff;
+		}
+		if (c == '/' || c == 0) {
+			if (left < ptr) {
+				std::string part(left, ptr);
+				if (part == "..") {
+					if (parts.empty()) {
+						return false; // traversal below root
+					}
+					parts.pop_back();
+				} else if (part != ".") {
+					parts.push_back(part);
+				}
+			}
+			if (c == 0) break;
+			ptr++;
+			left = ptr;
+		} else {
+			ptr++;
+		}
+	}
+
+	if (input[0] == '/') {
+		out->push_back('/');
+	}
+	for (size_t i = 0; i < parts.size(); i++) {
+		if (i > 0 || input[0] != '/') {
+			out->push_back('/');
+		}
+		out->append(parts[i]);
+	}
+	if (out->empty()) {
+		out->push_back('/');
+	}
+	// Preserve trailing slash so that "/app/" stays "/app/"
+	if (input.size() > 1 && input[input.size() - 1] == '/' && !out->empty() && (*out)[out->size() - 1] != '/') {
+		out->push_back('/');
+	}
+	return true;
+}
+

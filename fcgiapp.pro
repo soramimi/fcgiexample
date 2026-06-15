@@ -12,7 +12,8 @@ SOURCES += \
 	fcgi/libfcgi/fcgi_stdio.c \
 	fcgi/libfcgi/fcgiapp.c \
 	app/myfcgi.c \
-	app/main.cpp
+	app/main.cpp \
+	serv/debug.cpp
 
 win32:SOURCES += fcgi/libfcgi/os_win32.c
 unix:SOURCES += fcgi/libfcgi/os_unix.c
@@ -26,5 +27,6 @@ HEADERS += \
 	fcgi/include/fcgio.h \
 	fcgi/include/fcgios.h \
 	app/myfcgi.h \
-	app/myfcgi.h
+	app/myfcgi.h \
+	serv/debug.h
 

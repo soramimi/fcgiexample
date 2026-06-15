@@ -2,12 +2,17 @@
 #include <windows.h>
 #endif
 #include "FcgiProcess.h"
+#include "debug.h"
 #include "event.h"
 #include "mutex.h"
 #include "socket.h"
 #include "thread.h"
 #include <deque>
 #include <vector>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/wait.h>
+#endif
 
 
 #define FAILED_(S) throw std::string(S)
@@ -177,6 +182,19 @@ int FcgiProcess::read(char *ptr, int len)
 #include <sys/socket.h>
 #include <sys/un.h>
 
+namespace {
+void install_sigchld_handler()
+{
+	static bool installed = false;
+	if (!installed) {
+		struct sigaction sa = {};
+		sa.sa_handler = SIG_IGN;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGCHLD, &sa, nullptr);
+		installed = true;
+	}
+}
+}
 
 struct FcgiSocketIO::Private {
 	std::vector<NameValue> envvec;
@@ -220,16 +238,22 @@ bool FcgiSocketIO::connect()
 			struct addrinfo *res = nullptr;
 			hints.ai_socktype = SOCK_STREAM;
 			hints.ai_family = AF_INET;
-			getaddrinfo(host.c_str(), nullptr, &hints, &res);
-			if (res) {
-				if (res->ai_family == AF_INET) {
-					addr = *reinterpret_cast<struct sockaddr_in *>(res->ai_addr);
-				}
-				freeaddrinfo(res);
+			int r = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+			if (r != 0 || !res) {
+				return false;
 			}
+			if (res->ai_family != AF_INET) {
+				freeaddrinfo(res);
+				return false;
+			}
+			addr = *reinterpret_cast<struct sockaddr_in *>(res->ai_addr);
+			freeaddrinfo(res);
 		}
 		addr.sin_port = htons(port);
 		m->sock_io = socket(AF_INET, SOCK_STREAM, 0);
+		if (m->sock_io < 0) {
+			return false;
+		}
 		int r = ::connect(m->sock_io, (sockaddr *)&addr, sizeof(addr));
 		if (r != 0) {
 			closesocket(m->sock_io);
@@ -238,6 +262,7 @@ bool FcgiSocketIO::connect()
 		}
 		return true;
 	}
+	return false;
 }
 
 void FcgiSocketIO::disconnect()
@@ -268,6 +293,10 @@ FcgiProcess::FcgiProcess(const std::string &pipepath)
 FcgiProcess::~FcgiProcess()
 {
 	disconnect();
+	if (m->pid > 0) {
+		kill(m->pid, SIGTERM);
+		waitpid(m->pid, nullptr, WNOHANG);
+	}
 }
 
 void FcgiProcess::setEnvironment(std::vector<NameValue> *env)
@@ -288,6 +317,8 @@ void FcgiProcess::launch(std::string const &cmd)
 	Connection listener_pipe;
 	listener_pipe.create(m->name.c_str());
 
+	install_sigchld_handler();
+
 	m->pid = 0;
 
 	int pid = fork();
@@ -300,7 +331,7 @@ void FcgiProcess::launch(std::string const &cmd)
 		listener_pipe.close();
 
 		std::vector<std::string> args;
-		std::vector<char *> argv;
+		std::vector<char const *> argv;
 		{
 			char const *begin = cmd.c_str();
 			char const *end = begin + cmd.size();
@@ -323,14 +354,13 @@ void FcgiProcess::launch(std::string const &cmd)
 					ptr++;
 				}
 			}
-			for (std::string const &s : args) {
-				argv.push_back(const_cast<char *>(s.c_str()));
-			}
-			argv.push_back(nullptr);
 		}
-		if (execvp(argv[0], &argv[0]) < 0) {
+		for (std::string const &s : args) {
+			argv.push_back(s.c_str());
 		}
-		return;
+		argv.push_back(nullptr);
+		execvp(argv[0], const_cast<char *const *>(argv.data()));
+		_exit(127);
 	}
 
 	m->pid = pid;
