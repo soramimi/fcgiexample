@@ -457,6 +457,9 @@ private:
 					if (need == 0) {
 						need = sizeof(FCGI_Header);
 					}
+					if (need > tmp.size()) {
+						tmp.resize(need);
+					}
 					while (pos < need) {
 						int n = proc->read(&tmp[pos], need - pos);
 						if (n <= 0) {
