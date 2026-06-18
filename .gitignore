@@ -2,3 +2,5 @@
 _bin/
 build/
 .qtcreator/
+*.o
+Makefile

@@ -19,6 +19,7 @@
 #include "httpserver.h"
 #include "joinpath.h"
 #include "misc.h"
+#include "strformat.h"
 #include "thread.h"
 #include <algorithm>
 #include <limits>
@@ -34,6 +35,8 @@
 
 namespace {
 constexpr size_t MAX_CONTENT_LENGTH = 8 * 1024 * 1024; // 8MiB
+constexpr int    RECV_TIMEOUT_SEC   = 30;  // per-recv timeout (Slowloris mitigation)
+constexpr int    SEND_TIMEOUT_SEC   = 30;
 }
 
 std::string SocketBuffer::readline()
@@ -87,7 +90,7 @@ std::string SocketBuffer::readline()
 	}
 }
 
-void SocketBuffer::read(std::vector<char> *out, int maxlen)
+void SocketBuffer::read(std::vector<char> *out, size_t maxlen)
 {
 	out->clear();
 	if (buffer.empty()) {
@@ -96,13 +99,16 @@ void SocketBuffer::read(std::vector<char> *out, int maxlen)
 	while (1) {
 		if (offset < length) {
 			bool end = false;
-			int n = length - offset;
-			if (maxlen >= 0) {
+			size_t n = length - offset;
+			if (maxlen > 0) {
 				if (n >= maxlen) {
 					n = maxlen;
 					end = true;
 				}
 				maxlen -= n;
+			} else {
+				// maxlen == 0: nothing more to read
+				break;
 			}
 			unsigned char *left = &buffer[offset];
 			unsigned char *right = left + n;
@@ -121,6 +127,7 @@ void SocketBuffer::read(std::vector<char> *out, int maxlen)
 		}
 		int l = ::recv(sock, (char *)&buffer[0] + length, buffer.size() - length, 0);
 		if (l < 1) {
+			connected = false;
 			return;
 		}
 		length += l;
@@ -319,6 +326,7 @@ public:
 
 struct HTTP_Server::Private {
 	int tcp_port;
+	std::string bind_addr;
 	socket_t listening_socket;
 
 	HTTP_Handler *http_handler;
@@ -335,7 +343,7 @@ public:
 			char buf[65536];
 			int n = read(sock, buf, sizeof(buf));
 			if (n < 1) break;
-			printf("%d\n", n);
+			printlog(strformat("ws thread read %u bytes").u(n).str());
 		}
 	}
 };
@@ -356,15 +364,23 @@ public:
 
 				socklen_t len = sizeof(peer_sin);
 
-				socket_t connected_socket = accept(server->m->listening_socket, (struct sockaddr *)&peer_sin, &len);
-				if (connected_socket == -1) {
+				socket_t connected_socket = -1;
+				// Retry accept() on EINTR (signal interruption)
+				while (true) {
+					connected_socket = accept(server->m->listening_socket, (struct sockaddr *)&peer_sin, &len);
+					if (connected_socket != -1) break;
+					if (errno == EINTR) continue;
 					throw "accept failed";
 				}
+
+				// Apply send/recv timeouts to mitigate Slowloris and stuck clients
+				set_socket_timeout(connected_socket, RECV_TIMEOUT_SEC, SEND_TIMEOUT_SEC);
 
 				sockbuff.clear();
 				sockbuff.sock = connected_socket;
 				sockbuff.connected = true;
 
+				bool web_socket_upgraded = false;
 				while (sockbuff.connected) {
 					http_request_t request;
 					request.sockbuff = &sockbuff;
@@ -410,7 +426,7 @@ public:
 												if (sscanf(prot[1].c_str(), "%u.%u", &maj, &min) == 2) {
 													request.protocol_version.maj = maj;
 													request.protocol_version.min = min;
-											if (maj >= 1 && min >= 1) {
+											if (maj == 1 && min >= 1) {
 												response.keepalive = ConnectionType::KeepAlive;
 											}
 										}
@@ -427,14 +443,21 @@ public:
 									}
 								}
 								{
+									// Content-Length: reject duplicates (HTTP smuggling mitigation)
 									std::string s = request.header_value("Content-Length");
 									if (!s.empty()) {
+										size_t cl_count = 0;
+										for (size_t i = 0; i < request.header.size(); i++) {
+											if (strnicmp(request.header[i].c_str(), "Content-Length:", 15) == 0) {
+												cl_count++;
+											}
+										}
 										char *endptr = nullptr;
 										long cl = strtol(s.c_str(), &endptr, 10);
-										if (endptr == s.c_str() || *endptr != '\0' || cl < 0 || static_cast<unsigned long>(cl) > MAX_CONTENT_LENGTH) {
-											status = http413_request_entity_too_large;
+										if (cl_count > 1 || endptr == s.c_str() || *endptr != '\0' || cl < 0 || static_cast<unsigned long>(cl) > MAX_CONTENT_LENGTH) {
+											status = (cl_count > 1) ? http400_bad_request : http413_request_entity_too_large;
 										} else {
-											request.content_length = static_cast<unsigned int>(cl);
+											request.content_length = static_cast<size_t>(cl);
 										}
 									}
 								}
@@ -483,43 +506,66 @@ public:
 
 						// websocket
 						if (status == http101_switching_protocols && response.keepalive == ConnectionType::UpgradeWebSocket) {
+							web_socket_upgraded = true;
 							WebSocket ws;
-							while (sockbuff.connected) {
+							bool ws_ok = true;
+							while (sockbuff.connected && ws_ok) {
 								char buf[65536];
 								int n = read(connected_socket, buf, sizeof(buf));
 								if (n < 1) break;
 								std::vector<WebSocket::Message> messages;
 								if (!ws.feed(buf, n, &messages)) {
+									ws_ok = false;
 									break;
 								}
-							for (WebSocket::Message const &msg : messages) {
-								if (msg.opcode == 0x9) { // ping
-									auto frame = WebSocket::make_frame(0xa, msg.payload.data(), msg.payload.size());
-									if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
-										goto disconnect;
-									}
-								} else if (msg.opcode == 0xa) { // pong
-									// ignore
-								} else if (msg.opcode == 0x1 || msg.opcode == 0x2) {
-									std::string m(msg.payload.data(), msg.payload.size());
-									printf("%d %s\n", (int)msg.payload.size(), m.c_str());
-									if (m == "hello") {
-										std::string reply = "world";
-										auto frame = WebSocket::make_frame(0x1, reply.data(), reply.size());
+								for (WebSocket::Message const &msg : messages) {
+									if (msg.opcode == 0x9) { // ping
+										auto frame = WebSocket::make_frame(0xa, msg.payload.data(), msg.payload.size());
 										if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
-											goto disconnect;
+											ws_ok = false;
+											break;
+										}
+									} else if (msg.opcode == 0xa) { // pong
+										// ignore
+									} else if (msg.opcode == 0x1 || msg.opcode == 0x2) {
+										// Sanitize payload for logging: replace control chars
+										std::string m(msg.payload.data(), msg.payload.size());
+										std::string safe;
+										safe.reserve(m.size());
+										for (size_t k = 0; k < m.size(); k++) {
+											unsigned char ch = static_cast<unsigned char>(m[k]);
+											if (ch < 0x20 || ch == 0x7f) {
+												safe.push_back('?');
+											} else {
+												safe.push_back(static_cast<char>(ch));
+											}
+										}
+										printlog(strformat("ws recv %u bytes: %s").u(msg.payload.size()).s(safe).str());
+										if (m == "hello") {
+											std::string reply = "world";
+											auto frame = WebSocket::make_frame(0x1, reply.data(), reply.size());
+											if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
+												ws_ok = false;
+												break;
+											}
 										}
 									}
 								}
 							}
+							if (!ws_ok) {
+								// Send Close frame (status 1000) on protocol/error per RFC 6455 7.4
+								unsigned char close_payload[2] = {0x03, 0xe8}; // 1000
+								auto frame = WebSocket::make_frame(0x8, reinterpret_cast<char const *>(close_payload), 2);
+								send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size());
 							}
-							return;
+							break;
 						}
 						if (request.content_length > 0 && !request.content_consumed && sockbuff.connected) {
 							std::vector<char> discard;
 							size_t remaining = request.content_length;
 							while (remaining > 0 && sockbuff.connected) {
-								int to_read = static_cast<int>(std::min<size_t>(remaining, 65536));
+								size_t to_read = std::min<size_t>(remaining, 65536);
+								discard.clear();
 								sockbuff.read(&discard, to_read);
 								if (discard.empty()) {
 									sockbuff.connected = false;
@@ -533,7 +579,7 @@ public:
 						}
 					}
 				}
-disconnect:;
+				(void)web_socket_upgraded;
 				shutdown(connected_socket, SHUT_RDWR);
 				closesocket(connected_socket);
 			}
@@ -557,6 +603,7 @@ HTTP_Server::HTTP_Server(HTTP_Handler *handler)
 	m = new Private();
 	m->http_handler = handler;
 	m->tcp_port = 80;
+	m->bind_addr = "127.0.0.1"; // default: loopback only (do not expose to network by default)
 }
 
 HTTP_Server::~HTTP_Server()
@@ -567,6 +614,11 @@ HTTP_Server::~HTTP_Server()
 void HTTP_Server::setPort(int port)
 {
 	m->tcp_port = port;
+}
+
+void HTTP_Server::setBindAddress(std::string const &addr)
+{
+	m->bind_addr = addr;
 }
 
 static bool validate_url(std::string const &url)
@@ -594,7 +646,7 @@ static std::string make_location(std::string const &url)
 http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http_request_t *request, http_response_t *response, HTTPIO *io)
 {
 	for (std::string const &line : request->header) {
-		fprintf(stderr, "%s\n", line.c_str());
+		printlog(line);
 	}
 	if (!m->http_handler) {
 		return http503_service_unavailable;
@@ -655,7 +707,16 @@ bool HTTP_Server::run()
 
 		sin.sin_family = AF_INET;
 		sin.sin_port = htons(m->tcp_port);
-		sin.sin_addr.s_addr = htonl(INADDR_ANY);
+		// Bind to configured address (default 127.0.0.1 to avoid unintended exposure).
+		// Empty/invalid address falls back to INADDR_ANY only when explicitly requested via "0.0.0.0".
+		if (m->bind_addr.empty() || m->bind_addr == "0.0.0.0") {
+			sin.sin_addr.s_addr = htonl(INADDR_ANY);
+		} else {
+			sin.sin_addr.s_addr = inet_addr(m->bind_addr.c_str());
+			if (sin.sin_addr.s_addr == INADDR_NONE) {
+				throw std::string("invalid bind address");
+			}
+		}
 
 		if (bind(m->listening_socket, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
 			throw std::string("bind");
@@ -717,9 +778,9 @@ std::string http_request_t::header_value(const std::string &name) const
 	return std::string();
 }
 
-void http_request_t::read_content(std::vector<char> *out, int maxlen)
+void http_request_t::read_content(std::vector<char> *out, size_t maxlen)
 {
-	if (maxlen < 0) {
+	if (maxlen == 0) {
 		maxlen = content_length;
 	}
 	sockbuff->read(out, maxlen);

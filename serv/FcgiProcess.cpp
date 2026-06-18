@@ -223,15 +223,36 @@ bool FcgiSocketIO::connect()
 	if (m->type == FcgiSocketIO::UNIX) {
 		sockaddr_un addr = {};
 		addr.sun_family = AF_UNIX;
+		if (m->name.size() >= sizeof(addr.sun_path)) {
+			// path too long for sun_path
+			return false;
+		}
 		strcpy(addr.sun_path, m->name.c_str());
 		m->sock_io = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (m->sock_io < 0) {
+			return false;
+		}
+		set_socket_timeout(m->sock_io, 30, 30);
 		int r = ::connect(m->sock_io, (sockaddr *)&addr, sizeof(addr));
-		return r == 0;
+		if (r != 0) {
+			closesocket(m->sock_io);
+			m->sock_io = -1;
+			return false;
+		}
+		return true;
 	} else if (m->type == FcgiSocketIO::INET) {
 		char const *hostp = m->name.c_str();
 		char const *portp = strchr(hostp, ':');
 		std::string host = portp ? std::string(hostp, portp - hostp) : std::string(hostp);
-		int port = portp ? atoi(portp + 1) : 3000;
+		int port = 3000;
+		if (portp) {
+			char *endptr = nullptr;
+			long p = strtol(portp + 1, &endptr, 10);
+			if (endptr == portp + 1 || *endptr != '\0' || p < 1 || p > 65535) {
+				return false;
+			}
+			port = static_cast<int>(p);
+		}
 		sockaddr_in addr = {};
 		{
 			struct addrinfo hints = {};
@@ -254,6 +275,7 @@ bool FcgiSocketIO::connect()
 		if (m->sock_io < 0) {
 			return false;
 		}
+		set_socket_timeout(m->sock_io, 30, 30);
 		int r = ::connect(m->sock_io, (sockaddr *)&addr, sizeof(addr));
 		if (r != 0) {
 			closesocket(m->sock_io);
@@ -315,7 +337,11 @@ void FcgiProcess::launch(std::string const &cmd)
 	disconnect();
 
 	Connection listener_pipe;
-	listener_pipe.create(m->name.c_str());
+	if (!listener_pipe.create(m->name.c_str())) {
+		// Failed to create listening socket; cannot launch backend.
+		m->pid = 0;
+		return;
+	}
 
 	install_sigchld_handler();
 
@@ -327,6 +353,9 @@ void FcgiProcess::launch(std::string const &cmd)
 	}
 
 	if (pid == 0) { // child
+		if (listener_pipe.sock < 0) {
+			_exit(127);
+		}
 		dup2(listener_pipe.sock, 0);
 		listener_pipe.close();
 

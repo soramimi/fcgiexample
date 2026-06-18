@@ -40,7 +40,7 @@ struct SocketBuffer {
 		connected = false;
 	}
 	std::string readline();
-	void read(std::vector<char> *out, int maxlen);
+	void read(std::vector<char> *out, size_t maxlen);
 };
 
 enum class RequestMethod {
@@ -55,7 +55,7 @@ struct http_request_t {
 
 	std::string header_value(std::string const &name) const;
 
-	void read_content(std::vector<char> *out, int maxlen);
+	void read_content(std::vector<char> *out, size_t maxlen);
 
 	std::string protocol;
 	RequestMethod method = RequestMethod::INVALID;
@@ -65,7 +65,7 @@ struct http_request_t {
 	} protocol_version;
 	std::string uri;
 	std::string scheme;
-	unsigned int content_length = 0;
+	size_t content_length = 0;
 	bool content_consumed = false;
 };
 
@@ -139,6 +139,7 @@ public:
 	~HTTP_Server();
 
 	void setPort(int port);
+	void setBindAddress(std::string const &addr);
 
 	http_status_t const *http_process_request(HTTP_Thread *thread, http_request_t *request, http_response_t *response, HTTPIO *io);
 	bool http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &response);
