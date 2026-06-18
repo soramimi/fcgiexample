@@ -6,7 +6,7 @@
 
 `fcgiexample` は、C++ で書かれた最小限の **FastCGI サーバー／アプリケーションのサンプル** です。
 
-- `serv`（`fcgiserv`）: 簡易 HTTP サーバー。リクエストを受けて FastCGI アプリを起動・橋渡しする。
+- `serv`（`fcgiserv`）: 簡易 HTTP サーバー。リクエストを受けて FastCGI アプリを起動・橋渡しする。**`/static/` 以下は `static/` ディレクトリから静的ファイルを配信する。**
 - `app`（`fcgiapp`）: FastCGI 対応アプリケーション。サーバーからのリクエストに応答する。
 - `fcgi/`: FastCGI リファレンス実装（libfcgi）を内包。
 
@@ -20,6 +20,7 @@
 ├── fcgi/               FastCGI ライブラリ（libfcgi + include）
 ├── serv/               HTTP サーバー＋FastCGI ブリッジのソース
 ├── app/                FastCGI アプリケーションのソース
+├── static/             静的ファイル配信ディレクトリ
 ├── _bin/               ビルド済み実行ファイルの出力先
 ├── build/              qmake 中間生成物
 └── misc/               その他雑ファイル
@@ -62,6 +63,7 @@ make
 # ブラウザや curl でアクセス
 curl http://localhost:5000/app/
 curl http://localhost:5000/hello/
+curl http://localhost:5000/static/index.html
 ```
 
 ## 主要コンポーネント
@@ -70,7 +72,7 @@ curl http://localhost:5000/hello/
 
 | ファイル | 役割 |
 |---|---|
-| `main.cpp` | HTTP ハンドラ（`MyHandler`）とサーバー起動。`/app/` で FastCGI を呼び出す。 |
+| `main.cpp` | HTTP ハンドラ（`MyHandler`）とサーバー起動。`/app/` で FastCGI を呼び出し、`/static/` で静的ファイルを配信する。 |
 | `httpserver.cpp/h` | 簡易 HTTP/1.1 サーバー。リクエストパース、レスポンス送信、WebSocket ハンドシェイク。 |
 | `FcgiProcess.cpp/h` | FastCGI プロセス／ソケット接続の管理。Unix ドメインソケット、INET ソケット、子プロセス起動に対応。 |
 | `socket.h` | クロスプラットフォームなソケット型とヘルパー。 |
@@ -91,14 +93,15 @@ curl http://localhost:5000/hello/
 ## コードスタイル・注意事項
 
 - C++11 を使用（`CONFIG += c++11`）。
-- スペースインデント（4 スペース）が基本。
+- タブインデント（タブ幅 4 文字）が基本。
 - プラットフォーム分岐は `#ifdef _WIN32` / `#else` で行う。
 - `serv/main.cpp` 内の `invoke_fastcgi()` は、FastCGI プロトコルのエンコード／デコードを直接実装している。プロトコル変更時はここを確認すること。
-- FastCGI バックエンドの起動方式は `cmd` 文字列で切替可能:
+- FastCGI バックエンドの起動方式は `cmd` 文字列で切替可能（`serv/main.cpp` 内の `invoke_fastcgi()` 冒頭で定義）。現在の既定は `unix:/tmp/foo.sock` であり、プロセス直接起動の `./fcgiapp` はコメントで残されている。:
     - `./fcgiapp`（プロセス直接起動）: リクエストごとに `fork()` + `execvp()` で起動。リスニングソケットは1回の `accept()` で消費されるため、毎リクエスト再起動が必要（`proc_expired` フラグで管理）。
     - `unix:/path/to.sock`: Unix ドメインソケット接続。接続済みソケットはリクエスト間で再利用される。
     - `inet:host:port`: TCP 接続。同上。
 - デフォルトのバインドアドレスは `127.0.0.1`（ループバックのみ）。外部公開する場合は `HTTP_Server::setBindAddress("0.0.0.0")` を呼び出すこと。
+- **静的ファイル配信**: `/static/` 以下の **GET** リクエストを `serv/main.cpp` 内でハードコードされたドキュメントルート（`/home/soramimi/develop/fcgiexample/static`）から配信する。`misc::normalize_path()` を使って `..` 等を解決し、ルート外へのパストラバーサルを防ぐ。配信対象ファイルは 8MiB まで。`POST` 等の他メソッドは `405`、ディレクトリそのものや存在しないファイルは `404`、サイズ超過は `413` を返す。
 
 ### 既知の堅牢化対応
 
@@ -118,7 +121,8 @@ curl http://localhost:5000/hello/
 - **chdir の RAII**: `invoke_fastcgi()` 内の `chdir()` は `CwdGuard` でスコープ退出時に必ず復元される（早期 return / 例外安全）。
 - **子プロセス管理**: `execvp()` 失敗時に `_exit(127)`、`SIGCHLD` でゾンビ防止、デストラクタで `SIGTERM` 送信。`launch()` 失敗時は早期リターン。
 - **WebSocket**: RFC 6455 準拠のフレーム解析を実装。拡張ペイロード長、断片化、ping/pong/close に対応。最大メッセージサイズは 1MiB。プロトコルエラー時は Close フレーム（status 1000）を送信。ログ出力時はペイロードの制御文字をサニタイズ。
+- **Unix ソケットのクリーンアップ**: `app/myfcgi.c` の `serv_unix_socket()` は、正常終了時および `SIGTERM`/`SIGINT` 受信時に Unix ドメインソケットファイルを削除する。これにより、プロセス終了後のソケットファイル残存による次回起動時の `bind` エラーを防ぐ。
 
 ## Git の状態に関する注意
 
-`serv` 側の複数ファイルと `fcgiapp.pro` が変更済み（未コミット）の状態が確認されている。新たな編集前に `git status` / `git diff` を確認すること。
+`serv/main.cpp` 等に未コミットの変更があります。新たな編集前に `git status` / `git diff` を確認すること。

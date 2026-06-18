@@ -72,10 +72,10 @@ std::u16string joinpath(std::u16string const &left, std::u16string const &right)
 #if 0
 QString qjoinpath(ushort const *left, ushort const *right)
 {
-    std::vector<ushort> vec;
+	std::vector<ushort> vec;
 	joinpath_(left, right, &vec);
-    if (vec.empty()) return QString();
-    return QString::fromUtf16(&vec[0], vec.size());
+	if (vec.empty()) return QString();
+	return QString::fromUtf16(&vec[0], vec.size());
 }
 #endif
 

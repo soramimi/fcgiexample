@@ -13,8 +13,31 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 typedef int SOCKET;
 #define closesocket(S) close(S)
+
+static const char *unix_socket_path = 0;
+
+static void remove_unix_socket(void)
+{
+	if (unix_socket_path) {
+		remove(unix_socket_path);
+		unix_socket_path = 0;
+	}
+}
+
+#ifndef _WIN32
+static void unix_socket_signal_handler(int signo)
+{
+	(void)signo;
+	remove_unix_socket();
+	_exit(0);
+}
+#endif
 
 void serv_inet_socket(int port)
 {
@@ -81,6 +104,12 @@ void serv_unix_socket(char const *path)
 	}
 
 	chmod(sa.sun_path, 0777);
+	unix_socket_path = path;
+	atexit(remove_unix_socket);
+#ifndef _WIN32
+	signal(SIGTERM, unix_socket_signal_handler);
+	signal(SIGINT, unix_socket_signal_handler);
+#endif
 	dup2(sock, STDIN_FILENO);
 }
 

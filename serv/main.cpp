@@ -2,12 +2,16 @@
 #include "FcgiProcess.h"
 #include "debug.h"
 #include "httpserver.h"
+#include "joinpath.h"
 #include "misc.h"
 #include "socket.h"
+#include <algorithm>
 #include <list>
 #include <memory>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <vector>
 #include "base64.h"
 #include "sha1.h"
@@ -303,6 +307,114 @@ private:
 		}
 	}
 
+	static const size_t MAX_STATIC_FILE_SIZE = 8 * 1024 * 1024; // 8MiB
+
+	static std::string static_mime_type(std::string const &path)
+	{
+		size_t pos = path.rfind('.');
+		if (pos == std::string::npos) {
+			return "application/octet-stream";
+		}
+		std::string ext(path, pos + 1);
+		struct {
+			char const *ext;
+			char const *mime;
+		} map[] = {
+			{ "html", "text/html" },
+			{ "htm", "text/html" },
+			{ "css", "text/css" },
+			{ "js", "application/javascript" },
+			{ "json", "application/json" },
+			{ "png", "image/png" },
+			{ "jpg", "image/jpeg" },
+			{ "jpeg", "image/jpeg" },
+			{ "gif", "image/gif" },
+			{ "svg", "image/svg+xml" },
+			{ "txt", "text/plain" },
+			{ nullptr, nullptr }
+		};
+		for (int i = 0; map[i].ext; i++) {
+			if (ext.size() == strlen(map[i].ext) && stricmp(ext.c_str(), map[i].ext) == 0) {
+				return map[i].mime;
+			}
+		}
+		return "application/octet-stream";
+	}
+
+	http_status_t const *serve_static_file(std::string const &normalized_url, http_request_t const *request, http_response_t *response)
+	{
+		// Hardcoded document root for the /static/ URL prefix.
+		static std::string const prefix = "/static/";
+		static std::string const root = "/home/soramimi/develop/fcgiexample/static";
+
+		if (normalized_url.size() <= prefix.size() || normalized_url.compare(0, prefix.size(), prefix) != 0) {
+			return nullptr;
+		}
+
+		if (request->method != RequestMethod::GET) {
+			return http405_method_not_allowed;
+		}
+
+		std::string relpath = normalized_url.substr(prefix.size());
+		if (relpath.empty() || relpath.back() == '/') {
+			return nullptr; // directory listing is not supported -> 404
+		}
+
+		std::string normalized_relpath;
+		if (!misc::normalize_path('/' + relpath, &normalized_relpath)) {
+			return nullptr;
+		}
+		// normalized_relpath always starts with '/' because the input did.
+		std::string relative = normalized_relpath.substr(1);
+		if (relative.empty()) {
+			return nullptr;
+		}
+
+		std::string fullpath = joinpath(root, relative);
+		// Defensive check: the resolved path must remain inside the document root.
+		if (fullpath.size() < root.size() || fullpath.compare(0, root.size(), root) != 0) {
+			return nullptr;
+		}
+		if (fullpath.size() > root.size() && fullpath[root.size()] != '/') {
+			return nullptr;
+		}
+
+		FILE *fp = fopen(fullpath.c_str(), "rb");
+		if (!fp) {
+			return nullptr;
+		}
+		if (fseek(fp, 0, SEEK_END) != 0) {
+			fclose(fp);
+			return nullptr;
+		}
+		long size = ftell(fp);
+		if (size < 0) {
+			fclose(fp);
+			return nullptr;
+		}
+		if (static_cast<size_t>(size) > MAX_STATIC_FILE_SIZE) {
+			fclose(fp);
+			return http413_request_entity_too_large;
+		}
+		fseek(fp, 0, SEEK_SET);
+
+		std::vector<char> body;
+		if (size > 0) {
+			body.resize(static_cast<size_t>(size));
+			if (fread(body.data(), 1, body.size(), fp) != body.size()) {
+				fclose(fp);
+				return nullptr;
+			}
+		}
+		fclose(fp);
+
+		response->write("Content-Type: " + static_mime_type(relative) + "\r\n\r\n");
+		if (!body.empty()) {
+			response->write(body.data(), body.size());
+		}
+		return http200_ok;
+	}
+
 #pragma pack(push, 1)
 	struct FCGI_Header {
 		unsigned char version;
@@ -377,8 +489,8 @@ private:
 #ifdef _WIN32
 		char const *cmd = "C:/develop/tinyfcgi/app/tinyfcgi.exe";
 #else
-		char const *cmd = "./fcgiapp";
-		// char const *cmd = "unix:/tmp/foo.sock";
+		// char const *cmd = "./fcgiapp"; // process backend (fork+exec per request)
+		char const *cmd = "unix:/tmp/foo.sock";
 		// char const *cmd = "inet:localhost:3000";
 #endif
 
@@ -663,6 +775,11 @@ public:
 				response->keepalive = ConnectionType::UpgradeWebSocket;
 				return http101_switching_protocols;
 			}
+		}
+
+		http_status_t const *static_status = serve_static_file(normalized_location, request, response);
+		if (static_status) {
+			return static_status;
 		}
 
 		return http404_not_found;

@@ -4,6 +4,8 @@ CONFIG += console c++11
 CONFIG -= app_bundle
 CONFIG -= qt
 
+OBJECTS_DIR = $$PWD/build/fcgiapp-obj
+
 INCLUDEPATH += $$PWD/fcgi/include
 
 DESTDIR = $$PWD/_bin
@@ -26,7 +28,6 @@ HEADERS += \
 	fcgi/include/fcgimisc.h \
 	fcgi/include/fcgio.h \
 	fcgi/include/fcgios.h \
-	app/myfcgi.h \
 	app/myfcgi.h \
 	serv/debug.h
 
