@@ -364,19 +364,14 @@ private:
 
 		http_status_t const *serve_static_file(std::string const &path, http_request_t const *request, http_response_t *response)
 	{
-		// Hardcoded document root for the /static/ URL prefix.
-		static std::string const prefix = "/static/";
+		// Document root for static file serving (fallback for unmatched paths).
 		static std::string const root = "/home/soramimi/develop/fcgiexample/static";
-
-		if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) {
-			return nullptr;
-		}
 
 		if (request->method != RequestMethod::GET) {
 			return http405_method_not_allowed;
 		}
 
-		std::string relpath = path.substr(prefix.size());
+		std::string relpath = path;
 		if (relpath.empty() || relpath.back() == '/') {
 			return nullptr; // directory listing is not supported -> 404
 		}
