@@ -19,6 +19,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include "misc/uuid.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -744,6 +745,13 @@ private:
 				// Process backend: a fresh fork+exec is required each time because the
 				// listening socket is consumed by accept() on first connect.
 				is_process_backend = true;
+				std::string pipepath;
+				{ // generate pipe path
+					std::string uuid = UUIDv7::generate();
+					std::string tmp = "/tmp";
+					std::string name = "fcgi_" + uuid + ".sock";
+					pipepath = joinpath(tmp, name);
+				}
 				proc = std::make_shared<FcgiProcess>(pipepath);
 				proc->launch(cmd);
 			}

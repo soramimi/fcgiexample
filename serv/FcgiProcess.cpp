@@ -329,6 +329,8 @@ int FcgiSocketIO::read(char *ptr, int len)
 
 //
 
+
+
 FcgiProcess::FcgiProcess(const std::string &pipepath)
 	: FcgiSocketIO(UNIX, pipepath)
 {
@@ -341,6 +343,8 @@ FcgiProcess::~FcgiProcess()
 		kill(m->pid, SIGTERM);
 		waitpid(m->pid, nullptr, WNOHANG);
 	}
+	std::string pipepath = m->name;
+	unlink(pipepath.c_str());
 }
 
 void FcgiProcess::setEnvironment(std::vector<NameValue> *env)

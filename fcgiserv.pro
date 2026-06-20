@@ -11,6 +11,7 @@ DESTDIR = $$PWD/_bin
 unix:LIBS += -lpthread
 
 SOURCES += \
+	misc/uuid.cpp \
 	serv/base64.cpp \
 	serv/httpserver.cpp \
 	serv/httpstatus.cpp \
@@ -24,6 +25,7 @@ SOURCES += \
 	serv/main.cpp
 
 HEADERS += \
+	misc/uuid.h \
 	serv/base64.h \
 	serv/httpserver.h \
 	serv/httpstatus.h \

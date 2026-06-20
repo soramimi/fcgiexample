@@ -85,7 +85,7 @@ protected:
 	Private *m;
 
 public:
-	FcgiSocketIO(Type type, std::string const &name);
+	FcgiSocketIO(Type type, const std::string &name);
 	void setEnvironment(std::vector<NameValue> *)
 	{
 	}
@@ -120,7 +120,6 @@ class FcgiProcess : public FcgiSocketIO {
 private:
 	FcgiProcess(FcgiProcess const &);
 	void operator=(FcgiProcess const &);
-
 public:
 	FcgiProcess(std::string const &pipepath);
 	~FcgiProcess();
