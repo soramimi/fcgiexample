@@ -32,6 +32,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include "misc.h"
 
 namespace {
 constexpr size_t MAX_CONTENT_LENGTH = 8 * 1024 * 1024; // 8MiB
@@ -66,36 +67,41 @@ void install_termination_handlers()
 }
 #endif
 
-std::string_view trim_ascii(std::string_view value)
+size_t count_headers(std::vector<std::string> const &header, std::string_view name)
 {
-	while (!value.empty() && isspace(static_cast<unsigned char>(value.front()))) {
-		value.remove_prefix(1);
-	}
-	while (!value.empty() && isspace(static_cast<unsigned char>(value.back()))) {
-		value.remove_suffix(1);
-	}
-	return value;
-}
-
-bool same_header_name(std::string const &left, std::string const &right)
-{
-	size_t left_pos = left.find(':');
-	size_t right_pos = right.find(':');
-	if (left_pos == std::string::npos || right_pos == std::string::npos) {
-		return false;
-	}
-	std::string_view left_name = trim_ascii(std::string_view(left.data(), left_pos));
-	std::string_view right_name = trim_ascii(std::string_view(right.data(), right_pos));
-	if (left_name.size() != right_name.size()) {
-		return false;
-	}
-	for (size_t i = 0; i < left_name.size(); i++) {
-		if (tolower(static_cast<unsigned char>(left_name[i])) != tolower(static_cast<unsigned char>(right_name[i]))) {
-			return false;
+	size_t count = 0;
+	for (std::string const &line : header) {
+		if (line.size() > name.size() && strnicmp(line.c_str(), std::string(name).c_str(), name.size()) == 0 && line[name.size()] == ':') {
+			count++;
 		}
 	}
-	return true;
+	return count;
 }
+
+bool is_sensitive_request_header(std::string_view name)
+{
+	return misc::iequals_ascii(name, "Authorization") ||
+		misc::iequals_ascii(name, "Proxy-Authorization") ||
+		misc::iequals_ascii(name, "Cookie") ||
+		misc::iequals_ascii(name, "X-Api-Key");
+}
+
+
+std::string mask_header_for_log(std::string const &line)
+{
+	size_t pos = line.find(':');
+	if (pos == std::string::npos) {
+		return line;
+	}
+	std::string_view name(line.data(), pos);
+	if (!is_sensitive_request_header(misc::trim_ascii(name))) {
+		return line;
+	}
+	std::string masked(line.data(), line.data() + pos + 1);
+	masked += " [redacted]";
+	return masked;
+}
+
 }
 
 std::string SocketBuffer::readline()
@@ -507,22 +513,37 @@ public:
 								request.header.erase(request.header.begin());
 								{
 									std::string s = request.header_value("Connection");
-									if (stricmp(s.c_str(), "close") == 0) {
+									if (misc::header_has_token(s, "close")) {
 										response.keepalive = ConnectionType::Close;
-									} else if (stricmp(s.c_str(), "keep-alive") == 0) {
+									} else if (misc::header_has_token(s, "keep-alive")) {
 										response.keepalive = ConnectionType::KeepAlive;
 									}
 								}
 								{
+									size_t host_count = count_headers(request.header, "Host");
+									if (host_count > 1) {
+										status = http400_bad_request;
+									} else if (request.protocol == "HTTP" && request.protocol_version.maj == 1 && request.protocol_version.min >= 1 && host_count != 1) {
+										status = http400_bad_request;
+									}
+								}
+								if (!status) {
+									std::string transfer_encoding = request.header_value("Transfer-Encoding");
+									if (!transfer_encoding.empty()) {
+										status = http501_not_implemented;
+									}
+								}
+								if (!status) {
+									std::string expect = request.header_value("Expect");
+									if (!expect.empty()) {
+										status = http417_expectation_failed;
+									}
+								}
+								if (!status) {
 									// Content-Length: reject duplicates (HTTP smuggling mitigation)
 									std::string s = request.header_value("Content-Length");
 									if (!s.empty()) {
-										size_t cl_count = 0;
-										for (size_t i = 0; i < request.header.size(); i++) {
-											if (strnicmp(request.header[i].c_str(), "Content-Length:", 15) == 0) {
-												cl_count++;
-											}
-										}
+										size_t cl_count = count_headers(request.header, "Content-Length");
 										char *endptr = nullptr;
 										long cl = strtol(s.c_str(), &endptr, 10);
 										if (cl_count > 1 || endptr == s.c_str() || *endptr != '\0' || cl < 0 || static_cast<unsigned long>(cl) > MAX_CONTENT_LENGTH) {
@@ -708,7 +729,7 @@ http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http
 {
 	(void)thread;
 	for (std::string const &line : request->header) {
-		printlog(line);
+		printlog(mask_header_for_log(line));
 	}
 	if (!m->http_handler) {
 		return http503_service_unavailable;
@@ -742,7 +763,7 @@ bool HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *
 			}
 			bool replaced = false;
 			for (std::string &existing : deduped_header) {
-				if (same_header_name(existing, *it)) {
+				if (misc::same_header_name(existing, *it)) {
 					existing = *it;
 					replaced = true;
 					break;

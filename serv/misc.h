@@ -17,6 +17,16 @@ std::optional<std::string> normalize_path(const std::string &path);
 bool start_with(std::string_view str, std::string_view with);
 bool end_with(std::string_view str, std::string_view with);
 
+std::string_view trim_ascii(std::string_view value);
+bool same_header_name(std::string const &left, std::string const &right);
+bool iequals_ascii(std::string_view left, std::string_view right);
+
+bool header_has_token(std::string const &value, std::string_view token);
+
+int decode_base64_char(unsigned char ch);
+
+
+
 }
 
 class NameValue {

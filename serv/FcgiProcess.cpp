@@ -194,6 +194,27 @@ void install_sigchld_handler()
 		installed = true;
 	}
 }
+int write_all_fd(int fd, char const *ptr, int len)
+{
+	if (fd < 0 || !ptr || len <= 0) {
+		return 0;
+	}
+	int total = 0;
+	while (total < len) {
+		ssize_t n = ::write(fd, ptr + total, static_cast<size_t>(len - total));
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return total;
+		}
+		if (n == 0) {
+			break;
+		}
+		total += static_cast<int>(n);
+	}
+	return total;
+}
 }
 
 struct FcgiSocketIO::Private {
@@ -235,6 +256,7 @@ bool FcgiSocketIO::connect()
 		set_socket_timeout(m->sock_io, 30, 30);
 		int r = ::connect(m->sock_io, (sockaddr *)&addr, sizeof(addr));
 		if (r != 0) {
+			int e = errno;
 			closesocket(m->sock_io);
 			m->sock_io = -1;
 			return false;
@@ -297,7 +319,7 @@ void FcgiSocketIO::disconnect()
 
 int FcgiSocketIO::write(const char *ptr, int len)
 {
-	return ::write(m->sock_io, ptr, len);
+	return write_all_fd(m->sock_io, ptr, len);
 }
 
 int FcgiSocketIO::read(char *ptr, int len)

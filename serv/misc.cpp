@@ -156,3 +156,76 @@ bool misc::end_with(std::string_view str, std::string_view with)
 	}
 	return str.substr(str.size() - with.size(), with.size()) == with;
 }
+
+std::string_view misc::trim_ascii(std::string_view value)
+{
+	while (!value.empty() && isspace(static_cast<unsigned char>(value.front()))) {
+		value.remove_prefix(1);
+	}
+	while (!value.empty() && isspace(static_cast<unsigned char>(value.back()))) {
+		value.remove_suffix(1);
+	}
+	return value;
+}
+
+bool misc::same_header_name(const std::string &left, const std::string &right)
+{
+	size_t left_pos = left.find(':');
+	size_t right_pos = right.find(':');
+	if (left_pos == std::string::npos || right_pos == std::string::npos) {
+		return false;
+	}
+	std::string_view left_name = trim_ascii(std::string_view(left.data(), left_pos));
+	std::string_view right_name = trim_ascii(std::string_view(right.data(), right_pos));
+	if (left_name.size() != right_name.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < left_name.size(); i++) {
+		if (tolower(static_cast<unsigned char>(left_name[i])) != tolower(static_cast<unsigned char>(right_name[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool misc::iequals_ascii(std::string_view left, std::string_view right)
+{
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < left.size(); i++) {
+		if (tolower(static_cast<unsigned char>(left[i])) != tolower(static_cast<unsigned char>(right[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool misc::header_has_token(const std::string &value, std::string_view token)
+{
+	std::string_view rest = value;
+	while (!rest.empty()) {
+		size_t pos = rest.find(',');
+		std::string_view item = pos == std::string_view::npos ? rest : rest.substr(0, pos);
+		item = trim_ascii(item);
+		if (iequals_ascii(item, token)) {
+			return true;
+		}
+		if (pos == std::string_view::npos) {
+			break;
+		}
+		rest.remove_prefix(pos + 1);
+	}
+	return false;
+}
+
+int misc::decode_base64_char(unsigned char ch)
+{
+	if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+	if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+	if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+	if (ch == '+') return 62;
+	if (ch == '/') return 63;
+	if (ch == '=') return -2;
+	return -1;
+}
