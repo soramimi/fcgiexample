@@ -375,6 +375,8 @@ public:
 
 				// Apply send/recv timeouts to mitigate Slowloris and stuck clients
 				set_socket_timeout(connected_socket, RECV_TIMEOUT_SEC, SEND_TIMEOUT_SEC);
+				// Disable Nagle to ensure small interactive frames (101 headers, WS control frames) are sent immediately.
+				set_tcp_nodelay(connected_socket);
 
 				sockbuff.clear();
 				sockbuff.sock = connected_socket;
@@ -489,7 +491,7 @@ public:
 							char const *end = begin + response.content.size();
 							char const *ptr = parse_header(begin, end, &header);
 							int len = end - ptr;
-							{
+							if (status != http101_switching_protocols) {
 								char tmp[100];
 								sprintf(tmp, "Content-Length: %u", len);
 								header.push_back(tmp);
@@ -499,7 +501,7 @@ public:
 							}
 							if (!server->http_send_response_header(sockbuff.sock, status, header)) {
 								sockbuff.connected = false;
-							} else if (!send_all(sockbuff.sock, ptr, len)) {
+							} else if (status != http101_switching_protocols && !send_all(sockbuff.sock, ptr, len)) {
 								sockbuff.connected = false;
 							}
 						}
@@ -527,29 +529,28 @@ public:
 										}
 									} else if (msg.opcode == 0xa) { // pong
 										// ignore
-									} else if (msg.opcode == 0x1 || msg.opcode == 0x2) {
-										// Sanitize payload for logging: replace control chars
-										std::string m(msg.payload.data(), msg.payload.size());
-										std::string safe;
-										safe.reserve(m.size());
-										for (size_t k = 0; k < m.size(); k++) {
-											unsigned char ch = static_cast<unsigned char>(m[k]);
-											if (ch < 0x20 || ch == 0x7f) {
-												safe.push_back('?');
-											} else {
-												safe.push_back(static_cast<char>(ch));
-											}
-										}
-										printlog(strformat("ws recv %u bytes: %s").u(msg.payload.size()).s(safe).str());
-										if (m == "hello") {
-											std::string reply = "world";
-											auto frame = WebSocket::make_frame(0x1, reply.data(), reply.size());
-											if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
-												ws_ok = false;
-												break;
-											}
+								} else if (msg.opcode == 0x1 || msg.opcode == 0x2) {
+									// Sanitize payload for logging: replace control chars
+									std::string m(msg.payload.data(), msg.payload.size());
+									std::string safe;
+									safe.reserve(m.size());
+									for (size_t k = 0; k < m.size(); k++) {
+										unsigned char ch = static_cast<unsigned char>(m[k]);
+										if (ch < 0x20 || ch == 0x7f) {
+											safe.push_back('?');
+										} else {
+											safe.push_back(static_cast<char>(ch));
 										}
 									}
+									printlog(strformat("ws recv %u bytes: %s").u(msg.payload.size()).s(safe).str());
+									// Echo back the received message
+									printlog(strformat("ws sending echo (%u bytes)").u(msg.payload.size()).str());
+									auto frame = WebSocket::make_frame(msg.opcode, msg.payload.data(), msg.payload.size());
+									if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
+										ws_ok = false;
+										break;
+									}
+								}
 								}
 							}
 							if (!ws_ok) {
@@ -723,7 +724,7 @@ bool HTTP_Server::run()
 			throw std::string("listen");
 		}
 
-		int threadcount = 1;
+		int threadcount = 8;
 		threads.resize(threadcount);
 		for (int i = 0; i < threadcount; i++) {
 			threads[i].setup(this);

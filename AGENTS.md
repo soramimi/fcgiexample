@@ -92,7 +92,7 @@ curl http://localhost:5000/static/index.html
 
 ## コードスタイル・注意事項
 
-- C++11 を使用（`CONFIG += c++11`）。
+- C++17 を使用（`CONFIG += c++17`）。`std::string_view` / `std::optional` 等を使用するため。
 - タブインデント（タブ幅 4 文字）が基本。
 - プラットフォーム分岐は `#ifdef _WIN32` / `#else` で行う。
 - `serv/main.cpp` 内の `invoke_fastcgi()` は、FastCGI プロトコルのエンコード／デコードを直接実装している。プロトコル変更時はここを確認すること。
@@ -122,6 +122,30 @@ curl http://localhost:5000/static/index.html
 - **子プロセス管理**: `execvp()` 失敗時に `_exit(127)`、`SIGCHLD` でゾンビ防止、デストラクタで `SIGTERM` 送信。`launch()` 失敗時は早期リターン。
 - **WebSocket**: RFC 6455 準拠のフレーム解析を実装。拡張ペイロード長、断片化、ping/pong/close に対応。最大メッセージサイズは 1MiB。プロトコルエラー時は Close フレーム（status 1000）を送信。ログ出力時はペイロードの制御文字をサニタイズ。
 - **Unix ソケットのクリーンアップ**: `app/myfcgi.c` の `serv_unix_socket()` は、正常終了時および `SIGTERM`/`SIGINT` 受信時に Unix ドメインソケットファイルを削除する。これにより、プロセス終了後のソケットファイル残存による次回起動時の `bind` エラーを防ぐ。
+
+## 作業履歴
+
+### WebSocket テストページ追加＋サーバー側不具合修正
+
+ブラウザによる WebSocket 動作確認を目的として `static/ws.html`（エコーテスト UI）を追加した際に、複数の既存不具合が判明したため合わせて修正した。
+
+**変更ファイルと内容**
+
+| ファイル | 変更内容 |
+|---|---|
+| `fcgiapp.pro`, `fcgiserv.pro` | C++11 → C++17 (`std::string_view` / `std::optional` に対応)。 |
+| `static/ws.html` | 新規作成。`ws://host/sock` に接続し、テキストメッセージの送受信とログ表示ができる WebSocket テストページ。 |
+| `serv/socket.h` | `set_tcp_nodelay()` を追加（Nagle アルゴリズム無効化）。 |
+| `serv/httpserver.cpp` | - `accept()` 直後に `set_tcp_nodelay()` を呼び出し、小さなフレーム（101 レスポンス、WS 制御フレーム）を即座に送信するように変更。<br>- WebSocket 受信メッセージをエコー返信（受信内容をそのまま返す）に変更。<br>- エコー返信時にも `printlog` を追加して送受信を記録。<br>- `101 Switching Protocols` レスポンスでは `Content-Length` ヘッダーおよびレスポンスボディ (`send_all`) を送信しないように修正。ブラウザがハンドシェイクを拒否していた原因を解消。<br>- `HTTP_Server::run()` の worker スレッド数を **1 → 8** に増加。シングルスレッドでは `keep-alive` 接続中に新規接続がブロックしていたため。 |
+| `serv/main.cpp` | - `serve_static_file()` で `/static/` プレフィックス除去のコメントアウトを解除。`/static/...` パスが `404` になっていたのを修正。<br>- WebSocket ハンドシェイクの `Connection` ヘッダー値を RFC 7230 準拠の `Upgrade` に修正（元は小文字の `upgrade`）。 |
+| `serv/debug.cpp` | Linux 版 `printlog()` で `stderr` にも `[fcgiserv] ...` 形式で出力するように変更。サーバーをフォアグラウンド起動したターミナルでリアルタイムにログを確認可能。 |
+
+**修正した不具合の詳細**
+
+1. **静的ファイルが 404 になる**: `serve_static_file()` で `/static/` プレフィックス除去がコメントアウトされていたため、パスが `/static/static/...` のように重複解決され 404 になっていた。
+2. **WebSocket 接続確立に 1 分遅延**: `101 Switching Protocols` レスポンスが Nagle アルゴリズムによりバッファリングされていたため、ブラウザがハンドシェイク完了を待ち続けていた。`set_tcp_nodelay()` で即時送信に変更。
+3. **ブラウザがハンドシェイクを拒否**: `101 Switching Protocols` レスポンスに `Content-Length: 0` が付与されていたため、ブラウザが不正なレスポンスと判断していた。101 ステータスでは `Content-Length` とボディ送信を行わないように変更。
+4. **同一クライアントからの新規接続がブロック**: サーバーの worker スレッドが単一（1 本）だったため、前のリクエストの `keep-alive` 処理中に新しい WebSocket 接続を `accept()` できなかった。スレッド数を 8 に増加して解消。
 
 ## Git の状態に関する注意
 

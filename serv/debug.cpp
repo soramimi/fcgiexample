@@ -20,6 +20,8 @@ void startlog(char const *name)
 
 void printlog(char const *text)
 {
+	fprintf(stderr, "[%s] %s\n", "fcgiserv", text);
+	fflush(stderr);
 	syslog(LOG_DEBUG, "%s", text);
 }
 #endif

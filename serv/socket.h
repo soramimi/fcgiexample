@@ -17,6 +17,7 @@ typedef int socklen_t;
 #include <unistd.h>
 #include <sys/param.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 typedef int socket_t;
 #define closesocket(s) close(s)
@@ -44,6 +45,17 @@ inline bool set_socket_timeout(socket_t sock, int recv_sec, int send_sec)
 	tv.tv_sec = send_sec;
 	if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char const *)&tv, sizeof(tv)) != 0) return false;
 	return true;
+#endif
+}
+
+// Disable Nagle's algorithm to reduce latency for interactive protocols (WebSocket, keep-alive).
+inline bool set_tcp_nodelay(socket_t sock)
+{
+	int flag = 1;
+#ifdef _WIN32
+	return setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char const *)&flag, sizeof(flag)) == 0;
+#else
+	return setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char const *)&flag, sizeof(flag)) == 0;
 #endif
 }
 

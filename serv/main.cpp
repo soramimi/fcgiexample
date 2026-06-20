@@ -362,21 +362,21 @@ private:
 		return "application/octet-stream";
 	}
 
-	http_status_t const *serve_static_file(std::string const &path, http_request_t const *request, http_response_t *response)
+		http_status_t const *serve_static_file(std::string const &path, http_request_t const *request, http_response_t *response)
 	{
 		// Hardcoded document root for the /static/ URL prefix.
-		// static std::string const prefix = "/static/";
+		static std::string const prefix = "/static/";
 		static std::string const root = "/home/soramimi/develop/fcgiexample/static";
 
-		// if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) {
-		// 	return nullptr;
-		// }
+		if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) {
+			return nullptr;
+		}
 
 		if (request->method != RequestMethod::GET) {
 			return http405_method_not_allowed;
 		}
 
-		std::string relpath = path;
+		std::string relpath = path.substr(prefix.size());
 		if (relpath.empty() || relpath.back() == '/') {
 			return nullptr; // directory listing is not supported -> 404
 		}
@@ -753,6 +753,7 @@ public:
 	
 	virtual http_status_t const *do_get(HTTP_Server *server, std::string const &url, http_request_t *request, http_response_t *response, HTTPIO *io)
 	{
+		printlog("do_get url=" + url);
 		std::string path = url;
 		std::string question;
 		std::string sharp;
@@ -801,7 +802,9 @@ public:
 			return p ? p : http502_bad_gateway;
 		}
 
+		printlog("do_get path=" + path);
 		if (path == "/sock") {
+			printlog("matched /sock");
 			std::string sec = request->header_value("Sec-WebSocket-Key");
 			if (!sec.empty()) {
 				sec += "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -816,7 +819,7 @@ public:
 					sec.assign(h.data(), h.size());
 				}
 				response->write("Upgrade: websocket\r\n");
-				response->write("Connection: upgrade\r\n");
+				response->write("Connection: Upgrade\r\n");
 				response->write("Sec-WebSocket-Accept: " + sec + "\r\n");
 				response->write("\r\n");
 				response->keepalive = ConnectionType::UpgradeWebSocket;

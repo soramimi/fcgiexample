@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>WebSocket Test</title>
+<style>
+body { font-family: sans-serif; margin: 2em; }
+#log { border: 1px solid #ccc; padding: 1em; height: 300px; overflow-y: auto; white-space: pre-wrap; background: #f9f9f9; }
+input[type="text"] { width: 300px; }
+</style>
+</head>
+<body>
+<h1>WebSocket Test</h1>
+<p>Status: <span id="status">connecting...</span></p>
+<div>
+<input type="text" id="msg" placeholder="type a message" value="hello">
+<button id="sendBtn">Send</button>
+<button id="closeBtn">Close</button>
+</div>
+<h2>Log</h2>
+<div id="log"></div>
+
+<script>
+const log = document.getElementById('log');
+const status = document.getElementById('status');
+const msgInput = document.getElementById('msg');
+const sendBtn = document.getElementById('sendBtn');
+const closeBtn = document.getElementById('closeBtn');
+
+function append(text) {
+    log.textContent += text + '\n';
+    log.scrollTop = log.scrollHeight;
+}
+
+const wsHost = (location.host || 'localhost:5000');
+const wsUrl = 'ws://' + wsHost + '/sock';
+console.log('[ws] connecting to:', wsUrl);
+const ws = new WebSocket(wsUrl);
+
+ws.onopen = function() {
+    status.textContent = 'open';
+    status.style.color = 'green';
+    append('[connected]');
+    console.log('[ws] connected');
+};
+
+ws.onmessage = function(ev) {
+    append('<< ' + ev.data);
+    console.log('[ws] received:', ev.data);
+};
+
+ws.onclose = function(ev) {
+    status.textContent = 'closed (code=' + ev.code + ', reason=' + (ev.reason || 'none') + ')';
+    status.style.color = 'gray';
+    append('[disconnected] code=' + ev.code + ' reason=' + (ev.reason || 'none') + ' clean=' + ev.wasClean);
+    console.log('[ws] disconnected code=', ev.code, 'reason=', ev.reason, 'clean=', ev.wasClean);
+    sendBtn.disabled = true;
+    closeBtn.disabled = true;
+};
+
+ws.onerror = function(err) {
+    status.textContent = 'error';
+    status.style.color = 'red';
+    append('[error] see console');
+    console.error('[ws] error event:', err);
+    console.error('[ws] readyState 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED:', ws.readyState);
+};
+
+function send() {
+    const text = msgInput.value;
+    if (ws.readyState !== WebSocket.OPEN) {
+        console.warn('[ws] cannot send, readyState:', ws.readyState);
+        append('[error] connection not open (readyState=' + ws.readyState + ')');
+        return;
+    }
+    if (!text) {
+        console.warn('[ws] message is empty');
+        append('[warn] message is empty');
+        msgInput.focus();
+        return;
+    }
+    ws.send(text);
+    append('>> ' + text);
+    console.log('[ws] sent:', text);
+    msgInput.select();
+}
+
+sendBtn.addEventListener('click', send);
+msgInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') send();
+});
+closeBtn.addEventListener('click', function() {
+    ws.close();
+});
+</script>
+</body>
+</html>
