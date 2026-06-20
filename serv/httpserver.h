@@ -7,6 +7,7 @@
 #include <map>
 #include <string.h>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef _WIN32
@@ -89,9 +90,13 @@ public:
 	{
 		write_(begin, end);
 	}
-	void write(char const *text, size_t len = -1)
+	void write(char const *text)
 	{
-		write(text, text + (len == -1 ? strlen(text) : len));
+		write(text, strlen(text));
+	}
+	void write(char const *text, size_t len)
+	{
+		write(text, text + len);
 	}
 	void write(std::string_view const &str)
 	{
@@ -108,7 +113,6 @@ public:
 		}
 	}
 };
-
 
 class http_response_t : public HTTPIO {
 public:
@@ -130,6 +134,7 @@ public:
 
 class HTTP_Server {
 	friend class HTTP_Thread;
+
 private:
 	struct Private;
 	Private *m;
@@ -148,4 +153,3 @@ public:
 };
 
 #endif
-

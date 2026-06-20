@@ -1,32 +1,34 @@
 
 #include "FcgiProcess.h"
+#include "base64.h"
 #include "debug.h"
 #include "httpserver.h"
 #include "joinpath.h"
 #include "misc.h"
+#include "sha1.h"
 #include "socket.h"
+#include "strformat.h"
 #include <algorithm>
+#include <ctype.h>
+#include <fcntl.h>
 #include <list>
 #include <memory>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
-#include <vector>
-#include "base64.h"
-#include "sha1.h"
-#include "strformat.h"
-#include <fcntl.h>
+#include <string_view>
 #include <sys/stat.h>
+#include <vector>
 
 #ifdef _WIN32
+#include <direct.h>
 #include <mbctype.h>
 #include <shlobj.h>
-#include <direct.h>
 #else
-#include <sys/unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/unistd.h>
 #define strnicmp(A, B, C) strncasecmp(A, B, C)
 #define O_BINARY 0
 #endif
@@ -42,6 +44,7 @@ class CwdGuard {
 private:
 	std::string saved_;
 	bool valid_;
+
 public:
 	CwdGuard()
 		: valid_(false)
@@ -77,17 +80,231 @@ public:
 			valid_ = false;
 		}
 	}
-	std::string const & saved() const { return saved_; }
+	std::string const &saved() const { return saved_; }
+};
+
+namespace {
+
+std::string_view trim_ascii(std::string_view value)
+{
+	while (!value.empty() && isspace(static_cast<unsigned char>(value.front()))) {
+		value.remove_prefix(1);
+	}
+	while (!value.empty() && isspace(static_cast<unsigned char>(value.back()))) {
+		value.remove_suffix(1);
+	}
+	return value;
+}
+
+bool iequals_ascii(std::string_view left, std::string_view right)
+{
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < left.size(); i++) {
+		if (tolower(static_cast<unsigned char>(left[i])) != tolower(static_cast<unsigned char>(right[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool is_http_token_char(unsigned char ch)
+{
+	if (isalnum(ch)) return true;
+	switch (ch) {
+	case '!':
+	case '#':
+	case '$':
+	case '%':
+	case '&':
+	case '\'':
+	case '*':
+	case '+':
+	case '-':
+	case '.':
+	case '^':
+	case '_':
+	case '`':
+	case '|':
+	case '~':
+		return true;
+	}
+	return false;
+}
+
+bool is_valid_header_name(std::string_view name)
+{
+	if (name.empty()) {
+		return false;
+	}
+	for (unsigned char ch : name) {
+		if (!is_http_token_char(ch)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool is_valid_header_value(std::string_view value)
+{
+	for (unsigned char ch : value) {
+		if (ch == '\0' || ch == '\r' || ch == '\n') {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool is_hop_by_hop_response_header(std::string_view name)
+{
+	return iequals_ascii(name, "Connection") || iequals_ascii(name, "Keep-Alive") || iequals_ascii(name, "Proxy-Authenticate") || iequals_ascii(name, "Proxy-Authorization") || iequals_ascii(name, "TE") || iequals_ascii(name, "Trailer") || iequals_ascii(name, "Transfer-Encoding") || iequals_ascii(name, "Upgrade") || iequals_ascii(name, "Content-Length");
+}
+
+http_status_t const *http_status_from_code(int code)
+{
+	switch (code) {
+#define HTTP_STATUS(CODE, KEY, TEXT) \
+	case CODE: return http##CODE##KEY;
+#include "httpstatus.txt"
+#undef HTTP_STATUS
+	default:
+		return nullptr;
+	}
+}
+
+bool split_header_block(std::vector<char> const &data, size_t *header_end, std::vector<std::string> *header_lines)
+{
+	*header_end = 0;
+	header_lines->clear();
+	for (size_t i = 0; i + 1 < data.size(); i++) {
+		size_t terminator_len = 0;
+		if (i + 3 < data.size() && data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
+			terminator_len = 4;
+		} else if (data[i] == '\n' && data[i + 1] == '\n') {
+			terminator_len = 2;
+		}
+		if (terminator_len == 0) {
+			continue;
+		}
+		*header_end = i + terminator_len;
+		size_t line_begin = 0;
+		while (line_begin < i) {
+			size_t line_end = line_begin;
+			while (line_end < i && data[line_end] != '\n') {
+				line_end++;
+			}
+			size_t content_end = line_end;
+			if (content_end > line_begin && data[content_end - 1] == '\r') {
+				content_end--;
+			}
+			header_lines->emplace_back(&data[line_begin], &data[content_end]);
+			line_begin = line_end + 1;
+		}
+		return true;
+	}
+	return false;
+}
+
+bool sanitize_fcgi_response(std::vector<char> const &raw_stdout, http_response_t *response, http_status_t const **status_out)
+{
+	*status_out = http200_ok;
+	response->content.clear();
+
+	size_t header_end = 0;
+	std::vector<std::string> header_lines;
+	if (!split_header_block(raw_stdout, &header_end, &header_lines)) {
+		return false;
+	}
+
+	bool seen_status = false;
+	for (std::string const &line : header_lines) {
+		size_t pos = line.find(':');
+		if (pos == std::string::npos) {
+			return false;
+		}
+		std::string_view name = trim_ascii(std::string_view(line.data(), pos));
+		std::string_view value = trim_ascii(std::string_view(line.data() + pos + 1, line.size() - pos - 1));
+		if (!is_valid_header_name(name) || !is_valid_header_value(value)) {
+			return false;
+		}
+		if (iequals_ascii(name, "Status")) {
+			if (seen_status) {
+				return false;
+			}
+			seen_status = true;
+			std::string value_str(value);
+			char *endptr = nullptr;
+			long code = strtol(value_str.c_str(), &endptr, 10);
+			if (endptr == value_str.c_str() || code < 100 || code > 599) {
+				return false;
+			}
+			http_status_t const *mapped = http_status_from_code(static_cast<int>(code));
+			if (!mapped) {
+				return false;
+			}
+			*status_out = mapped;
+			continue;
+		}
+		if (is_hop_by_hop_response_header(name)) {
+			continue;
+		}
+		response->write(std::string(name) + ": " + std::string(value) + "\r\n");
+	}
+	response->write("\r\n");
+	if (header_end < raw_stdout.size()) {
+		response->write(raw_stdout.data() + header_end, raw_stdout.size() - header_end);
+	}
+	return true;
+}
+
+struct RequestTarget {
+	std::string path;
+	std::string query;
+};
+
+RequestTarget parse_request_target(std::string const &uri)
+{
+	RequestTarget target;
+	size_t end = uri.find_first_of("?#");
+	target.path = end == std::string::npos ? uri : uri.substr(0, end);
+	if (end != std::string::npos && uri[end] == '?') {
+		size_t query_end = uri.find('#', end + 1);
+		target.query = uri.substr(end + 1, query_end == std::string::npos ? std::string::npos : query_end - (end + 1));
+	}
+	return target;
+}
+
+bool make_http_env_name(std::string_view header_name, std::string *out)
+{
+	out->clear();
+	if (header_name.empty()) {
+		return false;
+	}
+	out->reserve(header_name.size() + 5);
+	out->append("HTTP_");
+	for (unsigned char ch : header_name) {
+		if (ch == '-') {
+			out->push_back('_');
+		} else if (isalnum(ch)) {
+			out->push_back(static_cast<char>(toupper(ch)));
+		} else {
+			return false;
+		}
+	}
+	return true;
+}
+
 };
 
 class AbstractHandler {
 public:
-	virtual ~AbstractHandler() {}
-	virtual http_status_t const *operator () (http_response_t *response) const = 0;
+	virtual ~AbstractHandler() { }
+	virtual http_status_t const *operator()(http_response_t *response) const = 0;
 };
 class HelloHandler : public AbstractHandler {
 public:
-	http_status_t const *operator () (http_response_t *response) const
+	http_status_t const *operator()(http_response_t *response) const
 	{
 		response->write("Content-Type: text/plain\r\n");
 		response->write("Connection: close\r\n");
@@ -103,9 +320,9 @@ public:
 		std::vector<std::string> header;
 		std::vector<char> data;
 	};
-private:
 
-//	Connection pipe;
+private:
+	//	Connection pipe;
 	std::string pipepath;
 	std::shared_ptr<AbstractFcgi> proc;
 	bool proc_expired = false; // true when proc is a fork-based backend that must re-launch next time
@@ -142,7 +359,6 @@ private:
 			}
 		}
 		out->length = get_content_length(request);
-
 	}
 
 	void parse_form_part(char const *begin, char const *end, FormPart *out) const
@@ -255,8 +471,7 @@ private:
 
 	void setEnvironment(std::vector<NameValue> *list, std::string const &name, std::string const &value)
 	{
-		if (name.find('\r') != std::string::npos || name.find('\n') != std::string::npos ||
-			value.find('\r') != std::string::npos || value.find('\n') != std::string::npos) {
+		if (name.find('\r') != std::string::npos || name.find('\n') != std::string::npos || value.find('\r') != std::string::npos || value.find('\n') != std::string::npos) {
 			return; // prevent header injection
 		}
 		// Reject NUL bytes in name/value (CGI apps may treat values as C strings)
@@ -274,41 +489,17 @@ private:
 
 	void makeEnvironment(http_request_t const *request, std::vector<NameValue> *out)
 	{
-		auto MAKE = [&](std::string const &name){
-			setEnvironment(out, name, std::string());
-		};
+		RequestTarget target = parse_request_target(request->uri);
+		std::string script_name;
+		std::string path_info;
+		if (target.path == "/app") {
+			script_name = "/app";
+		} else if (target.path.size() > 4 && target.path.compare(0, 4, "/app") == 0 && target.path[4] == '/') {
+			script_name = "/app";
+			path_info = target.path.substr(4);
+		}
+
 		out->clear();
-		setEnvironment(out, "FCGI_ROLE", "RESPONDER");
-		MAKE("HTTP_HOST"); // =localhost
-		MAKE("HTTP_CONNECTION"); // =keep-alive
-		MAKE("HTTP_UPGRADE_INSECURE_REQUESTS"); // =1
-		MAKE("HTTP_USER_AGENT"); // =Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36
-		MAKE("HTTP_SEC_FETCH_MODE"); // =navigate
-		MAKE("HTTP_SEC_FETCH_USER"); // =?1
-		MAKE("HTTP_ACCEPT"); // =text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3
-		MAKE("HTTP_SEC_FETCH_SITE"); // =none
-		MAKE("HTTP_ACCEPT_ENCODING"); // =gzip, deflate, br
-		MAKE("HTTP_ACCEPT_LANGUAGE"); // =ja,en-US;q=0.9,en;q=0.8
-		MAKE("PATH"); // =/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-		MAKE("SERVER_SIGNATURE"); // =<address>Apache/2.4.18 (Ubuntu) Server at localhost Port 80</address>
-		MAKE("SERVER_SOFTWARE"); // =Apache/2.4.18 (Ubuntu)
-		MAKE("SERVER_NAME"); // =localhost
-		MAKE("SERVER_ADDR"); // =::1
-		MAKE("SERVER_PORT"); // =80
-		MAKE("REMOTE_ADDR"); // =::1
-		MAKE("DOCUMENT_ROOT"); // =/var/www/html
-		MAKE("REQUEST_SCHEME"); // =http
-		MAKE("CONTEXT_PREFIX"); // =
-		MAKE("CONTEXT_DOCUMENT_ROOT"); // =/var/www/html
-		MAKE("SERVER_ADMIN"); // =webmaster@localhost
-		MAKE("SCRIPT_FILENAME"); // =proxy:fcgi://localhost:3000/
-		MAKE("REMOTE_PORT"); // =38214
-		MAKE("GATEWAY_INTERFACE"); // =CGI/1.1
-		MAKE("SERVER_PROTOCOL"); // =HTTP/1.1
-		MAKE("REQUEST_METHOD"); // =GET
-		MAKE("QUERY_STRING"); // =
-		MAKE("REQUEST_URI"); // =/app/
-		MAKE("SCRIPT_NAME"); // =/app/
 
 		if (request->method == RequestMethod::GET) {
 			setEnvironment(out, "REQUEST_METHOD", "GET");
@@ -316,19 +507,44 @@ private:
 			setEnvironment(out, "REQUEST_METHOD", "POST");
 		}
 
-		setEnvironment(out, "SERVER_PROTOCOL", strformat("%s/%u.%u")
-					   .s(request->protocol)
-					   .u(request->protocol_version.maj)
-					   .u(request->protocol_version.min)
-					   .str());
+		setEnvironment(out, "SERVER_PROTOCOL", strformat("%s/%u.%u").s(request->protocol).u(request->protocol_version.maj).u(request->protocol_version.min).str());
 		setEnvironment(out, "GATEWAY_INTERFACE", "CGI/1.1");
+		setEnvironment(out, "REQUEST_SCHEME", request->scheme.empty() ? "http" : request->scheme);
 		setEnvironment(out, "REQUEST_URI", request->uri);
+		setEnvironment(out, "QUERY_STRING", target.query);
+		setEnvironment(out, "SCRIPT_NAME", script_name);
+		if (!path_info.empty()) {
+			setEnvironment(out, "PATH_INFO", path_info);
+		}
+		setEnvironment(out, "SCRIPT_FILENAME", "./fcgiapp");
+		{
+			std::string content_type = request->header_value("Content-Type");
+			if (!content_type.empty()) {
+				setEnvironment(out, "CONTENT_TYPE", content_type);
+			}
+		}
 		if (request->content_length > 0) {
 			setEnvironment(out, "CONTENT_LENGTH", strformat("%u").u(request->content_length).str());
 		}
+		for (std::string const &line : request->header) {
+			size_t pos = line.find(':');
+			if (pos == std::string::npos) {
+				continue;
+			}
+			std::string_view name = trim_ascii(std::string_view(line.data(), pos));
+			std::string_view value = trim_ascii(std::string_view(line.data() + pos + 1, line.size() - pos - 1));
+			if (iequals_ascii(name, "Content-Type") || iequals_ascii(name, "Content-Length")) {
+				continue;
+			}
+			std::string env_name;
+			if (!make_http_env_name(name, &env_name)) {
+				continue;
+			}
+			setEnvironment(out, env_name, std::string(value));
+		}
 	}
 
-	static const size_t MAX_STATIC_FILE_SIZE = 8 * 1024 * 1024; // 8MiB
+	static size_t const MAX_STATIC_FILE_SIZE = 8 * 1024 * 1024; // 8MiB
 
 	static std::string static_mime_type(std::string const &path)
 	{
@@ -362,7 +578,7 @@ private:
 		return "application/octet-stream";
 	}
 
-		http_status_t const *serve_static_file(std::string const &path, http_request_t const *request, http_response_t *response)
+	http_status_t const *serve_static_file(std::string const &path, http_request_t const *request, http_response_t *response)
 	{
 		// Document root for static file serving (fallback for unmatched paths).
 		static std::string const root = "/home/soramimi/develop/fcgiexample/static";
@@ -469,34 +685,35 @@ private:
 	static_assert(sizeof(FCGI_EndRequestBody) == 8, "FCGI_EndRequestBody must be 8 bytes");
 
 	enum {
-		FCGI_RESPONDER  = 1,
+		FCGI_RESPONDER = 1,
 		FCGI_AUTHORIZER = 2,
-		FCGI_FILTER     = 3,
+		FCGI_FILTER = 3,
 	};
 
 	enum {
-		FCGI_BEGIN_REQUEST      = 1,
-		FCGI_ABORT_REQUEST      = 2,
-		FCGI_END_REQUEST        = 3,
-		FCGI_PARAMS             = 4,
-		FCGI_STDIN              = 5,
-		FCGI_STDOUT             = 6,
-		FCGI_STDERR             = 7,
-		FCGI_DATA               = 8,
-		FCGI_GET_VALUES         = 9,
-		FCGI_GET_VALUES_RESULT  =10,
+		FCGI_BEGIN_REQUEST = 1,
+		FCGI_ABORT_REQUEST = 2,
+		FCGI_END_REQUEST = 3,
+		FCGI_PARAMS = 4,
+		FCGI_STDIN = 5,
+		FCGI_STDOUT = 6,
+		FCGI_STDERR = 7,
+		FCGI_DATA = 8,
+		FCGI_GET_VALUES = 9,
+		FCGI_GET_VALUES_RESULT = 10,
 	};
 
 	// Maximum total bytes accepted from the FastCGI upstream (response body + overhead).
 	// Prevents unbounded memory growth from a malicious/buggy responder.
-	static const size_t FCGI_MAX_RESPONSE_BYTES = 64 * 1024 * 1024; // 64MiB
+	static size_t const FCGI_MAX_RESPONSE_BYTES = 64 * 1024 * 1024; // 64MiB
 	// Per-read timeout (seconds) for FastCGI upstream communication.
-	static const int    FCGI_TIMEOUT_SEC = 30;
+	static int const FCGI_TIMEOUT_SEC = 30;
 	// Maximum FastCGI record count to bound loop iterations.
-	static const size_t FCGI_MAX_RECORDS = 100000;
+	static size_t const FCGI_MAX_RECORDS = 100000;
 
 	http_status_t const *invoke_fastcgi(http_request_t *request, http_response_t *response, HTTPIO *io)
 	{
+		(void)io;
 #ifdef _WIN32
 		char const *cmd = "C:/develop/tinyfcgi/app/tinyfcgi.exe";
 #else
@@ -505,7 +722,7 @@ private:
 		// char const *cmd = "inet:localhost:3000";
 #endif
 
-		CwdGuard cwd_guard; // B4: restore cwd on any return path
+		CwdGuard cwd_guard;
 
 		{
 			int i = misc::last_index_of(cmd, '/');
@@ -513,7 +730,6 @@ private:
 			if (i < j) i = j;
 			if (i > 0) {
 				std::string dir(cmd, cmd + i);
-
 #ifdef _WIN32
 				_chdir(dir.c_str());
 #else
@@ -521,233 +737,242 @@ private:
 #endif
 			}
 		}
-		{
-			std::vector<NameValue> env;
-			makeEnvironment(request, &env);
 
-			// D3: always (re)establish the FastCGI backend per request when it is a
-			// process-type backend. Socket-type backends (unix:/inet:) are safe to reuse.
-			bool is_process_backend = false;
-			if (strncmp(cmd, "unix:", 5) == 0) {
-				if (!proc || proc_expired) {
-					proc = std::make_shared<FcgiUnixSocket>(cmd + 5);
-					proc->launch("");
-				}
-			} else if (strncmp(cmd, "inet:", 5) == 0) {
-				if (!proc || proc_expired) {
-					proc = std::make_shared<FcgiInetSocket>(cmd + 5);
-					proc->launch("");
-				}
-			} else {
-				// Process backend: a fresh fork+exec is required each time because the
-				// listening socket is consumed by accept() on first connect.
-				is_process_backend = true;
-				proc = std::make_shared<FcgiProcess>(pipepath);
-				proc->launch(cmd);
+		std::vector<NameValue> env;
+		makeEnvironment(request, &env);
+
+		bool is_process_backend = false;
+		if (strncmp(cmd, "unix:", 5) == 0) {
+			if (!proc || proc_expired) {
+				proc = std::make_shared<FcgiUnixSocket>(cmd + 5);
+				proc->launch("");
 			}
-			if (!proc->connect()) {
-				proc.reset();
-				return http503_service_unavailable;
+		} else if (strncmp(cmd, "inet:", 5) == 0) {
+			if (!proc || proc_expired) {
+				proc = std::make_shared<FcgiInetSocket>(cmd + 5);
+				proc->launch("");
 			}
-			// Process backends must re-launch every request (listening socket consumed);
-			// socket backends can be reused. Clear the flag only for socket backends.
-			proc_expired = is_process_backend;
+		} else {
+			is_process_backend = true;
+			proc = std::make_shared<FcgiProcess>(pipepath);
+			proc->launch(cmd);
+		}
+		if (!proc->connect()) {
+			proc.reset();
+			return http503_service_unavailable;
+		}
+		proc_expired = is_process_backend;
 
-			uint16_t reqid = 1;
-
-			auto make_fcgi_header = [&](std::vector<char> *vec, int type){
-				FCGI_Header *h = (FCGI_Header *)&vec->at(0);
-				h->version = 1;
-				h->type = type;
-				h->requestIdB1 = reqid >> 8;
-				h->requestIdB0 = reqid;
-				auto setcontentlength = [](FCGI_Header *h, uint16_t len){
-					h->contentLengthB1 = len >> 8;
-					h->contentLengthB0 = len;
-				};
-				setcontentlength(h, vec->size() - sizeof(FCGI_Header));
-			};
-
-			auto write_fcgi_begin_request = [&](int role){
-				std::vector<char> vec(sizeof(FCGI_BeginRequestRecord));
-				FCGI_BeginRequestRecord *beginreq = (FCGI_BeginRequestRecord *)&vec[0];
-				beginreq->body.roleB1 = role >> 8;
-				beginreq->body.roleB0 = role;
-				beginreq->body.flags = 0;
-				make_fcgi_header(&vec, FCGI_BEGIN_REQUEST);
-				proc->write(&vec[0], vec.size());
-			};
-			write_fcgi_begin_request(FCGI_RESPONDER);
-
-			// C5: FastCGI params must be split across multiple FCGI_PARAMS records
-			// when the serialized payload exceeds the 65535-byte content length limit.
-			auto write_fcgi_params = [&](std::vector<NameValue> const &params){
-				// First, serialize all name/value pairs into one buffer (without header).
-				std::vector<char> body;
-				body.reserve(1024);
-				auto append_length = [&body](size_t len){
-					if (len < 128) {
-						body.push_back(static_cast<char>(len));
-					} else {
-						body.push_back(static_cast<char>((len >> 24) | 0x80));
-						body.push_back(static_cast<char>(len >> 16));
-						body.push_back(static_cast<char>(len >> 8));
-						body.push_back(static_cast<char>(len));
-					}
-				};
-				auto append_name_value = [&](std::string const &name, std::string const &value){
-					append_length(name.size());
-					append_length(value.size());
-					body.insert(body.end(), name.begin(), name.end());
-					body.insert(body.end(), value.begin(), value.end());
-				};
-				for (NameValue const &param : params) {
-					append_name_value(param.name(), param.value());
-				}
-
-				// Split into chunks no larger than 65535 bytes per record content.
-				const size_t MAX_CONTENT = 65535;
-				size_t pos = 0;
-				if (body.empty()) {
-					// Empty params record (terminator).
-					std::vector<char> vec(sizeof(FCGI_Header));
-					make_fcgi_header(&vec, FCGI_PARAMS);
-					proc->write(&vec[0], vec.size());
-					return;
-				}
-				while (pos < body.size()) {
-					size_t chunk = std::min(body.size() - pos, MAX_CONTENT);
-					std::vector<char> vec(sizeof(FCGI_Header) + chunk);
-					memcpy(&vec[sizeof(FCGI_Header)], &body[pos], chunk);
-					make_fcgi_header(&vec, FCGI_PARAMS);
-					proc->write(&vec[0], vec.size());
-					pos += chunk;
-				}
-			};
-
-			write_fcgi_params(env);
-			// Empty params record to signal end of params stream.
-			{
-				std::vector<NameValue> empty;
-				write_fcgi_params(empty);
-			}
-
-			// Empty STDIN record to signal end of request body (no body in this sample).
-			{
-				std::vector<char> vec(sizeof(FCGI_Header));
-				make_fcgi_header(&vec, FCGI_STDIN);
-				proc->write(&vec[0], vec.size());
-			}
-
-			// A1: parse response with timeout, END_REQUEST requirement, and total size cap.
-			bool got_end_request = false;
-			bool upstream_error = false;
-			{
-				std::vector<char> tmp;
-				tmp.reserve(65536 + 256);
-				size_t pos = 0;
-				size_t need = 0;
-				FCGI_Header header = {};
-				uint16_t contentlength = 0;
-				size_t total_received = 0;
-				size_t record_count = 0;
-
-				while (1) {
-					if (need == 0) {
-						need = sizeof(FCGI_Header);
-					}
-					if (need > tmp.size()) {
-						tmp.resize(need);
-					}
-					while (pos < need) {
-						int n = proc->read(&tmp[pos], need - pos);
-						if (n <= 0) {
-							// read error or timeout
-							upstream_error = true;
-							break;
-						}
-						pos += n;
-						total_received += n;
-						if (total_received > FCGI_MAX_RESPONSE_BYTES) {
-							upstream_error = true;
-							break;
-						}
-					}
-					if (upstream_error) break;
-
-					if (pos == sizeof(FCGI_Header)) {
-						memcpy(&header, tmp.data(), sizeof(FCGI_Header));
-						contentlength = ((uint16_t)header.contentLengthB1 << 8) | header.contentLengthB0;
-						if (header.type == FCGI_STDOUT && contentlength == 0) {
-							// Empty STDOUT record: not necessarily end of stream; keep reading.
-							pos = 0;
-							need = 0;
-							continue;
-						}
-						need = sizeof(FCGI_Header) + contentlength + header.paddingLength;
-						if (need > FCGI_MAX_RESPONSE_BYTES) {
-							upstream_error = true;
-							break;
-						}
-						if (need > tmp.size()) {
-							tmp.resize(need);
-						}
-					} else if (pos == need) {
-						record_count++;
-						if (record_count > FCGI_MAX_RECORDS) {
-							upstream_error = true;
-							break;
-						}
-						char const *p = tmp.data() + sizeof(FCGI_Header);
-						if (header.type == FCGI_STDOUT) {
-							io->write(p, contentlength);
-						} else if (header.type == FCGI_STDERR) {
-							std::string err(p, contentlength);
-							printlog("fcgi stderr: " + err);
-						} else if (header.type == FCGI_END_REQUEST) {
-							if (pos >= sizeof(FCGI_Header) + sizeof(FCGI_EndRequestBody)) {
-								FCGI_EndRequestBody const *h = (FCGI_EndRequestBody const *)&tmp[sizeof(FCGI_Header)];
-								uint32_t appstat = (h->appStatusB3 << 24) | (h->appStatusB2 << 16) | (h->appStatusB1 << 8) | h->appStatusB0;
-								uint32_t protstat = h->protocolStatus;
-								(void)appstat;
-								(void)protstat;
-							}
-							got_end_request = true;
-							break;
-						}
-						pos = 0;
-						need = 0;
-						contentlength = 0;
-						continue;
-					}
-				}
-			}
-
+		auto finish_with = [&](http_status_t const *status) {
 			proc->disconnect();
-
-			// If this was a process backend, drop the handle so the next request re-launches.
 			if (proc_expired) {
 				proc.reset();
 			}
+			return status;
+		};
 
-			if (upstream_error || !got_end_request) {
-				return http502_bad_gateway;
+		uint16_t reqid = 1;
+		auto make_fcgi_header = [&](std::vector<char> *vec, int type) {
+			FCGI_Header *h = (FCGI_Header *)&vec->at(0);
+			h->version = 1;
+			h->type = type;
+			h->requestIdB1 = reqid >> 8;
+			h->requestIdB0 = reqid;
+			auto setcontentlength = [](FCGI_Header *header, uint16_t len) {
+				header->contentLengthB1 = len >> 8;
+				header->contentLengthB0 = len;
+			};
+			setcontentlength(h, vec->size() - sizeof(FCGI_Header));
+		};
+
+		auto write_fcgi_record = [&](int type, char const *data, size_t len) {
+			if (len > 65535) {
+				return false;
 			}
-			return http200_ok;
+			std::vector<char> vec(sizeof(FCGI_Header) + len);
+			if (len > 0) {
+				memcpy(&vec[sizeof(FCGI_Header)], data, len);
+			}
+			make_fcgi_header(&vec, type);
+			return proc->write(&vec[0], vec.size()) == static_cast<int>(vec.size());
+		};
+
+		{
+			std::vector<char> vec(sizeof(FCGI_BeginRequestRecord));
+			FCGI_BeginRequestRecord *beginreq = (FCGI_BeginRequestRecord *)&vec[0];
+			beginreq->body.roleB1 = FCGI_RESPONDER >> 8;
+			beginreq->body.roleB0 = FCGI_RESPONDER;
+			beginreq->body.flags = 0;
+			make_fcgi_header(&vec, FCGI_BEGIN_REQUEST);
+			if (proc->write(&vec[0], vec.size()) != static_cast<int>(vec.size())) {
+				return finish_with(http502_bad_gateway);
+			}
 		}
-		return nullptr;
+
+		auto write_fcgi_params = [&](std::vector<NameValue> const &params) {
+			std::vector<char> body;
+			body.reserve(1024);
+			auto append_length = [&body](size_t len) {
+				if (len < 128) {
+					body.push_back(static_cast<char>(len));
+				} else {
+					body.push_back(static_cast<char>((len >> 24) | 0x80));
+					body.push_back(static_cast<char>(len >> 16));
+					body.push_back(static_cast<char>(len >> 8));
+					body.push_back(static_cast<char>(len));
+				}
+			};
+			auto append_name_value = [&](std::string const &name, std::string const &value) {
+				append_length(name.size());
+				append_length(value.size());
+				body.insert(body.end(), name.begin(), name.end());
+				body.insert(body.end(), value.begin(), value.end());
+			};
+			for (NameValue const &param : params) {
+				append_name_value(param.name(), param.value());
+			}
+
+			size_t const max_content = 65535;
+			size_t pos = 0;
+			if (body.empty()) {
+				return write_fcgi_record(FCGI_PARAMS, nullptr, 0);
+			}
+			while (pos < body.size()) {
+				size_t chunk = std::min(body.size() - pos, max_content);
+				if (!write_fcgi_record(FCGI_PARAMS, &body[pos], chunk)) {
+					return false;
+				}
+				pos += chunk;
+			}
+			return true;
+		};
+
+		if (!write_fcgi_params(env)) {
+			return finish_with(http502_bad_gateway);
+		}
+		if (!write_fcgi_record(FCGI_PARAMS, nullptr, 0)) {
+			return finish_with(http502_bad_gateway);
+		}
+
+		if (request->content_length > 0) {
+			size_t remaining = request->content_length;
+			while (remaining > 0) {
+				size_t chunk_len = std::min<size_t>(remaining, 65535);
+				std::vector<char> chunk;
+				request->read_content(&chunk, chunk_len);
+				if (chunk.empty()) {
+					return finish_with(http400_bad_request);
+				}
+				if (!write_fcgi_record(FCGI_STDIN, chunk.data(), chunk.size())) {
+					return finish_with(http502_bad_gateway);
+				}
+				remaining -= chunk.size();
+			}
+		}
+		if (!write_fcgi_record(FCGI_STDIN, nullptr, 0)) {
+			return finish_with(http502_bad_gateway);
+		}
+
+		bool got_end_request = false;
+		bool upstream_error = false;
+		std::vector<char> raw_stdout;
+		std::vector<char> tmp;
+		tmp.reserve(65536 + 256);
+		size_t pos = 0;
+		size_t need = 0;
+		FCGI_Header header = { };
+		uint16_t contentlength = 0;
+		size_t total_received = 0;
+		size_t record_count = 0;
+
+		while (1) {
+			if (need == 0) {
+				need = sizeof(FCGI_Header);
+			}
+			if (need > tmp.size()) {
+				tmp.resize(need);
+			}
+			while (pos < need) {
+				int n = proc->read(&tmp[pos], need - pos);
+				if (n <= 0) {
+					upstream_error = true;
+					break;
+				}
+				pos += n;
+				total_received += n;
+				if (total_received > FCGI_MAX_RESPONSE_BYTES) {
+					upstream_error = true;
+					break;
+				}
+			}
+			if (upstream_error) break;
+
+			if (pos == sizeof(FCGI_Header)) {
+				memcpy(&header, tmp.data(), sizeof(FCGI_Header));
+				contentlength = ((uint16_t)header.contentLengthB1 << 8) | header.contentLengthB0;
+				if (header.type == FCGI_STDOUT && contentlength == 0) {
+					pos = 0;
+					need = 0;
+					continue;
+				}
+				need = sizeof(FCGI_Header) + contentlength + header.paddingLength;
+				if (need > FCGI_MAX_RESPONSE_BYTES) {
+					upstream_error = true;
+					break;
+				}
+				if (need > tmp.size()) {
+					tmp.resize(need);
+				}
+			} else if (pos == need) {
+				record_count++;
+				if (record_count > FCGI_MAX_RECORDS) {
+					upstream_error = true;
+					break;
+				}
+				char const *p = tmp.data() + sizeof(FCGI_Header);
+				if (header.type == FCGI_STDOUT) {
+					raw_stdout.insert(raw_stdout.end(), p, p + contentlength);
+					if (raw_stdout.size() > FCGI_MAX_RESPONSE_BYTES) {
+						upstream_error = true;
+						break;
+					}
+				} else if (header.type == FCGI_STDERR) {
+					std::string err(p, contentlength);
+					printlog("fcgi stderr: " + err);
+				} else if (header.type == FCGI_END_REQUEST) {
+					got_end_request = true;
+					break;
+				}
+				pos = 0;
+				need = 0;
+				contentlength = 0;
+			}
+		}
+
+		if (upstream_error || !got_end_request) {
+			return finish_with(http502_bad_gateway);
+		}
+
+		http_status_t const *upstream_status = http200_ok;
+		if (!sanitize_fcgi_response(raw_stdout, response, &upstream_status)) {
+			return finish_with(http502_bad_gateway);
+		}
+		return finish_with(upstream_status);
 	}
 
 private:
 	std::map<std::string, std::function<http_status_t *(http_response_t *response)>> handlers_;
+
 public:
 	template <typename T> void emplace_handler(std::string const &path, std::function<http_status_t *(HTTPIO *response)> fn)
 	{
 		handlers_.emplace(path, fn);
 	}
-	
+
 	virtual http_status_t const *do_get(HTTP_Server *server, std::string const &url, http_request_t *request, http_response_t *response, HTTPIO *io)
 	{
+		(void)server;
+		(void)io;
 		printlog("do_get url=" + url);
 		std::string path = url;
 		std::string question;
@@ -771,7 +996,8 @@ public:
 				right = s;
 			}
 			if (right) {
-				while (left < right && right[-1] == '/') right--;
+				while (left < right && right[-1] == '/')
+					right--;
 				path.assign(left, right);
 			}
 		}
@@ -791,8 +1017,8 @@ public:
 				path = pathview;
 			}
 		}
-		
-		if (path == "/app") {
+
+		if (path == "/app" || (path.size() > 4 && path.compare(0, 4, "/app") == 0 && path[4] == '/')) {
 			auto p = invoke_fastcgi(request, response, response);
 			return p ? p : http502_bad_gateway;
 		}
@@ -825,10 +1051,10 @@ public:
 		{ // dispatch to user defined handlers
 			auto it = handlers_.find(path);
 			if (it != handlers_.end()) {
-				return it->second.operator ()(response);
+				return it->second.operator()(response);
 			}
 		}
-		
+
 		{ // static file serving for unmatched paths
 			http_status_t const *static_status = serve_static_file(path, request, response);
 			if (static_status) {
@@ -859,7 +1085,7 @@ public:
 
 	void createPipe()
 	{
-//		pipe.create(pipepath);
+		//		pipe.create(pipepath);
 	}
 
 	MyHandler(std::string const &name)
@@ -871,11 +1097,9 @@ public:
 	~MyHandler()
 	{
 		unlink(pipepath.c_str());
-//		pipe.close();
+		//		pipe.close();
 	}
 };
-
-
 
 int main()
 {
@@ -890,11 +1114,12 @@ int main()
 		atexit((void (*)(void))(WSACleanup));
 	}
 #else
+	chdir("/home/soramimi/develop/fcgiexample/_bin");
 	startlog("tinyfcgiserver");
 #endif
 
 	MyHandler handler("tinyfcgiserver");
-	handler.emplace_handler<HelloHandler>("/hello", [&](HTTPIO *io){
+	handler.emplace_handler<HelloHandler>("/hello", [&](HTTPIO *io) {
 		io->write("Content-Type: text/plain\r\n");
 		io->write("Connection: close\r\n");
 		io->write("\r\n");
@@ -904,13 +1129,12 @@ int main()
 
 	HTTP_Server server(&handler);
 
-//#ifdef _WIN32
-//	std::string wwwroot = "C:/develop/tinyfcgiserver/wwwroot";
-//#else
-//	std::string wwwroot = "/home/soramimi/develop/tinyfcgiserver/wwwroot/";
-//#endif
+	// #ifdef _WIN32
+	//	std::string wwwroot = "C:/develop/tinyfcgiserver/wwwroot";
+	// #else
+	//	std::string wwwroot = "/home/soramimi/develop/tinyfcgiserver/wwwroot/";
+	// #endif
 	server.setPort(5000);
 
 	return server.run() ? 0 : 1;
 }
-

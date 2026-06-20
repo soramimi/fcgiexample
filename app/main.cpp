@@ -1,9 +1,11 @@
 
 #include "myfcgi.h"
-#include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 #include <time.h>
+#include <unistd.h>
+#include <vector>
 
 // cgi mode:
 // $ ./fcgiapp
@@ -13,7 +15,6 @@
 //
 // unix socket mode:
 // $ ./fcgiapp -p /tmp/foo.sock
-
 
 int main(int argc, char **argv)
 {
@@ -44,7 +45,7 @@ int main(int argc, char **argv)
 
 	while (FCGI_Accept() >= 0) {
 
-		auto Write = [](char const *ptr, size_t len){
+		auto Write = [](char const *ptr, size_t len) {
 			FCGI_fwrite((void *)ptr, 1, len, FCGI_stdout);
 		};
 
@@ -61,6 +62,26 @@ int main(int argc, char **argv)
 			Write(s, strlen(s));
 			Write("\r\n", 2);
 		}
+		{
+			char const *content_length = getenv("CONTENT_LENGTH");
+			long len = content_length ? strtol(content_length, nullptr, 10) : 0;
+			if (len > 0) {
+				std::vector<char> body(static_cast<size_t>(len));
+				size_t total = 0;
+				while (total < body.size()) {
+					int n = FCGI_fread(body.data() + total, 1, body.size() - total, FCGI_stdin);
+					if (n <= 0) {
+						break;
+					}
+					total += static_cast<size_t>(n);
+				}
+				Write("Request-Body:\r\n", 15);
+				if (total > 0) {
+					Write(body.data(), total);
+				}
+				Write("\r\n\r\n", 4);
+			}
+		}
 		Write("\r\n", 2);
 		char **e = fcgi_environ ? fcgi_environ : environ;
 		if (e) {
@@ -75,4 +96,3 @@ int main(int argc, char **argv)
 
 	return 0;
 }
-

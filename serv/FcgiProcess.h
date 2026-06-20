@@ -8,9 +8,9 @@
 
 #ifdef _WIN32
 #else
-#include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -63,11 +63,10 @@ public:
 };
 #endif
 
-
 class AbstractFcgi {
 public:
 	virtual void setEnvironment(std::vector<NameValue> *env) = 0;
-	virtual void launch(const std::string &cmd) = 0;
+	virtual void launch(std::string const &cmd) = 0;
 	virtual bool connect() = 0;
 	virtual void disconnect() = 0;
 	virtual int write(char const *ptr, int len) = 0;
@@ -80,20 +79,22 @@ public:
 		UNIX,
 		INET,
 	};
+
 protected:
 	struct Private;
 	Private *m;
+
 public:
 	FcgiSocketIO(Type type, std::string const &name);
-	void setEnvironment(std::vector<NameValue> *env)
+	void setEnvironment(std::vector<NameValue> *)
 	{
 	}
-	void launch(const std::string &cmd)
+	void launch(std::string const &)
 	{
 	}
 	bool connect();
 	void disconnect();
-	int write(const char *ptr, int len);
+	int write(char const *ptr, int len);
 	int read(char *ptr, int len);
 };
 
@@ -115,14 +116,16 @@ public:
 
 class FcgiProcess : public FcgiSocketIO {
 	friend class StreamThread;
+
 private:
 	FcgiProcess(FcgiProcess const &);
-	void operator = (FcgiProcess const &);
+	void operator=(FcgiProcess const &);
+
 public:
 	FcgiProcess(std::string const &pipepath);
 	~FcgiProcess();
 	void setEnvironment(std::vector<NameValue> *env);
-	void launch(const std::string &cmd);
+	void launch(std::string const &cmd);
 };
 
 #endif // FCGIPROCESS_H

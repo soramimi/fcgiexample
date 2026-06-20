@@ -5,11 +5,12 @@
 #include "socket.h"
 
 #ifdef _WIN32
-#include <io.h>
 #include <fcntl.h>
+#include <io.h>
 #include <sys/stat.h>
 #else
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #define O_BINARY 0
 #define strnicmp(A, B, C) strncasecmp(A, B, C)
@@ -31,12 +32,70 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
-#include "misc.h"
 
 namespace {
 constexpr size_t MAX_CONTENT_LENGTH = 8 * 1024 * 1024; // 8MiB
-constexpr int    RECV_TIMEOUT_SEC   = 30;  // per-recv timeout (Slowloris mitigation)
-constexpr int    SEND_TIMEOUT_SEC   = 30;
+constexpr int RECV_TIMEOUT_SEC = 30; // per-recv timeout (Slowloris mitigation)
+constexpr int SEND_TIMEOUT_SEC = 30;
+
+#ifndef _WIN32
+volatile sig_atomic_t g_shutdown_requested = 0;
+volatile sig_atomic_t g_listening_socket_for_signal = -1;
+
+extern "C" void handle_termination_signal(int)
+{
+	g_shutdown_requested = 1;
+	if (g_listening_socket_for_signal >= 0) {
+		close(static_cast<int>(g_listening_socket_for_signal));
+		g_listening_socket_for_signal = -1;
+	}
+}
+
+void install_termination_handlers()
+{
+	static bool installed = false;
+	if (installed) {
+		return;
+	}
+	struct sigaction sa = { };
+	sa.sa_handler = handle_termination_signal;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, nullptr);
+	sigaction(SIGTERM, &sa, nullptr);
+	installed = true;
+}
+#endif
+
+std::string_view trim_ascii(std::string_view value)
+{
+	while (!value.empty() && isspace(static_cast<unsigned char>(value.front()))) {
+		value.remove_prefix(1);
+	}
+	while (!value.empty() && isspace(static_cast<unsigned char>(value.back()))) {
+		value.remove_suffix(1);
+	}
+	return value;
+}
+
+bool same_header_name(std::string const &left, std::string const &right)
+{
+	size_t left_pos = left.find(':');
+	size_t right_pos = right.find(':');
+	if (left_pos == std::string::npos || right_pos == std::string::npos) {
+		return false;
+	}
+	std::string_view left_name = trim_ascii(std::string_view(left.data(), left_pos));
+	std::string_view right_name = trim_ascii(std::string_view(right.data(), right_pos));
+	if (left_name.size() != right_name.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < left_name.size(); i++) {
+		if (tolower(static_cast<unsigned char>(left_name[i])) != tolower(static_cast<unsigned char>(right_name[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
 }
 
 std::string SocketBuffer::readline()
@@ -189,6 +248,7 @@ static bool send_all(socket_t sock, char const *ptr, int len)
 class RequestHandlerMap {
 private:
 	std::map<std::string, RequestHandler *> map;
+
 public:
 	void add(std::string const &suffix, RequestHandler *handler)
 	{
@@ -214,6 +274,7 @@ public:
 		int opcode;
 		std::vector<char> payload;
 	};
+
 private:
 	std::vector<unsigned char> buffer;
 	std::vector<char> current_message;
@@ -236,8 +297,9 @@ private:
 		}
 		return true;
 	}
+
 public:
-	bool feed(const char *data, int len, std::vector<Message> *out)
+	bool feed(char const *data, int len, std::vector<Message> *out)
 	{
 		if (closing) return false;
 		buffer.insert(buffer.end(), reinterpret_cast<unsigned char const *>(data), reinterpret_cast<unsigned char const *>(data) + len);
@@ -301,7 +363,7 @@ public:
 		}
 	}
 
-	static std::vector<unsigned char> make_frame(int opcode, const char *data, size_t len)
+	static std::vector<unsigned char> make_frame(int opcode, char const *data, size_t len)
 	{
 		std::vector<unsigned char> frame;
 		frame.push_back(static_cast<unsigned char>(0x80 | (opcode & 0x0f)));
@@ -370,6 +432,13 @@ public:
 					connected_socket = accept(server->m->listening_socket, (struct sockaddr *)&peer_sin, &len);
 					if (connected_socket != -1) break;
 					if (errno == EINTR) continue;
+					if (
+#ifndef _WIN32
+						g_shutdown_requested ||
+#endif
+						server->m->listening_socket == -1) {
+						return;
+					}
 					throw "accept failed";
 				}
 
@@ -423,11 +492,11 @@ public:
 								misc::split_words(first[2], '/', &prot);
 								if (prot.size() == 2) {
 									request.protocol = prot[0];
-											if (request.protocol == "HTTP") {
-												unsigned int maj, min;
-												if (sscanf(prot[1].c_str(), "%u.%u", &maj, &min) == 2) {
-													request.protocol_version.maj = maj;
-													request.protocol_version.min = min;
+									if (request.protocol == "HTTP") {
+										unsigned int maj, min;
+										if (sscanf(prot[1].c_str(), "%u.%u", &maj, &min) == 2) {
+											request.protocol_version.maj = maj;
+											request.protocol_version.min = min;
 											if (maj == 1 && min >= 1) {
 												response.keepalive = ConnectionType::KeepAlive;
 											}
@@ -529,33 +598,33 @@ public:
 										}
 									} else if (msg.opcode == 0xa) { // pong
 										// ignore
-								} else if (msg.opcode == 0x1 || msg.opcode == 0x2) {
-									// Sanitize payload for logging: replace control chars
-									std::string m(msg.payload.data(), msg.payload.size());
-									std::string safe;
-									safe.reserve(m.size());
-									for (size_t k = 0; k < m.size(); k++) {
-										unsigned char ch = static_cast<unsigned char>(m[k]);
-										if (ch < 0x20 || ch == 0x7f) {
-											safe.push_back('?');
-										} else {
-											safe.push_back(static_cast<char>(ch));
+									} else if (msg.opcode == 0x1 || msg.opcode == 0x2) {
+										// Sanitize payload for logging: replace control chars
+										std::string m(msg.payload.data(), msg.payload.size());
+										std::string safe;
+										safe.reserve(m.size());
+										for (size_t k = 0; k < m.size(); k++) {
+											unsigned char ch = static_cast<unsigned char>(m[k]);
+											if (ch < 0x20 || ch == 0x7f) {
+												safe.push_back('?');
+											} else {
+												safe.push_back(static_cast<char>(ch));
+											}
+										}
+										printlog(strformat("ws recv %u bytes: %s").u(msg.payload.size()).s(safe).str());
+										// Echo back the received message
+										printlog(strformat("ws sending echo (%u bytes)").u(msg.payload.size()).str());
+										auto frame = WebSocket::make_frame(msg.opcode, msg.payload.data(), msg.payload.size());
+										if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
+											ws_ok = false;
+											break;
 										}
 									}
-									printlog(strformat("ws recv %u bytes: %s").u(msg.payload.size()).s(safe).str());
-									// Echo back the received message
-									printlog(strformat("ws sending echo (%u bytes)").u(msg.payload.size()).str());
-									auto frame = WebSocket::make_frame(msg.opcode, msg.payload.data(), msg.payload.size());
-									if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
-										ws_ok = false;
-										break;
-									}
-								}
 								}
 							}
 							if (!ws_ok) {
 								// Send Close frame (status 1000) on protocol/error per RFC 6455 7.4
-								unsigned char close_payload[2] = {0x03, 0xe8}; // 1000
+								unsigned char close_payload[2] = { 0x03, 0xe8 }; // 1000
 								auto frame = WebSocket::make_frame(0x8, reinterpret_cast<char const *>(close_payload), 2);
 								send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size());
 							}
@@ -598,7 +667,6 @@ void RequestHandler::write(http_response_t *response, void const *ptr, int len)
 	response->content.insert(response->content.end(), p, p + len);
 }
 
-
 HTTP_Server::HTTP_Server(HTTP_Handler *handler)
 {
 	m = new Private();
@@ -636,12 +704,9 @@ static bool validate_url(std::string const &url)
 	return (bool)misc::normalize_path(url);
 }
 
-static std::string make_location(std::string const &url)
-{
-	return "Location: " + url;
-}
 http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http_request_t *request, http_response_t *response, HTTPIO *io)
 {
+	(void)thread;
 	for (std::string const &line : request->header) {
 		printlog(line);
 	}
@@ -662,7 +727,9 @@ http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http
 bool HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &header)
 {
 	std::vector<unsigned char> out;
+	std::vector<std::string> deduped_header;
 	out.reserve(1024);
+	deduped_header.reserve(header.size());
 	{
 		char tmp[100];
 		sprintf(tmp, "HTTP/1.1 %03u %s\r\n", status->code, status->text);
@@ -670,6 +737,22 @@ bool HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *
 	}
 	if (!header.empty()) {
 		for (std::vector<std::string>::const_iterator it = header.begin(); it != header.end(); it++) {
+			if (it->find(':') == std::string::npos) {
+				continue;
+			}
+			bool replaced = false;
+			for (std::string &existing : deduped_header) {
+				if (same_header_name(existing, *it)) {
+					existing = *it;
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) {
+				deduped_header.push_back(*it);
+			}
+		}
+		for (std::vector<std::string>::const_iterator it = deduped_header.begin(); it != deduped_header.end(); it++) {
 			unsigned char const *p = (unsigned char const *)it->c_str();
 			out.insert(out.end(), p, p + it->size());
 			out.push_back('\r');
@@ -724,6 +807,12 @@ bool HTTP_Server::run()
 			throw std::string("listen");
 		}
 
+#ifndef _WIN32
+		install_termination_handlers();
+		g_shutdown_requested = 0;
+		g_listening_socket_for_signal = m->listening_socket;
+#endif
+
 		int threadcount = 8;
 		threads.resize(threadcount);
 		for (int i = 0; i < threadcount; i++) {
@@ -737,17 +826,24 @@ bool HTTP_Server::run()
 #ifdef _WIN32
 			Sleep(100);
 #else
+			if (g_shutdown_requested) {
+				break;
+			}
 			usleep(100000);
 #endif
 		}
 
-		shutdown(m->listening_socket, SHUT_RDWR);
-		ret = closesocket(m->listening_socket);
-		if (ret == -1) {
-			throw std::string("close");
+		if (m->listening_socket != -1) {
+			shutdown(m->listening_socket, SHUT_RDWR);
+			ret = closesocket(m->listening_socket);
+			m->listening_socket = -1;
+			if (ret == -1) {
+				throw std::string("close");
+			}
 		}
 
 		for (int i = 0; i < threadcount; i++) {
+			threads[i].stop();
 			threads[i].join();
 		}
 	} catch (std::string const &e) {
@@ -760,15 +856,17 @@ bool HTTP_Server::run()
 
 //
 
-std::string http_request_t::header_value(const std::string &name) const
+std::string http_request_t::header_value(std::string const &name) const
 {
 	for (std::vector<std::string>::const_iterator it = header.begin(); it != header.end(); it++) {
 		if (strnicmp(it->c_str(), name.c_str(), name.size()) == 0 && it->c_str()[name.size()] == ':') {
 			char const *left = it->c_str();
 			char const *right = left + it->size();
 			left += name.size() + 1;
-			while (left < right && isspace(left[0] & 0xff)) left++;
-			while (left < right && isspace(right[-1] & 0xff)) right--;
+			while (left < right && isspace(left[0] & 0xff))
+				left++;
+			while (left < right && isspace(right[-1] & 0xff))
+				right--;
 			return std::string(left, right);
 		}
 	}
@@ -783,4 +881,3 @@ void http_request_t::read_content(std::vector<char> *out, size_t maxlen)
 	sockbuff->read(out, maxlen);
 	content_consumed = true;
 }
-

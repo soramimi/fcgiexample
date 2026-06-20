@@ -21,6 +21,7 @@
 ├── serv/               HTTP サーバー＋FastCGI ブリッジのソース
 ├── app/                FastCGI アプリケーションのソース
 ├── static/             静的ファイル配信ディレクトリ
+├── test/               Bash ベースの結合テスト群
 ├── _bin/               ビルド済み実行ファイルの出力先
 ├── build/              qmake 中間生成物
 └── misc/               その他雑ファイル
@@ -65,6 +66,32 @@ curl http://localhost:5000/app/
 curl http://localhost:5000/hello/
 curl http://localhost:5000/static/index.html
 ```
+
+補足:
+
+- `fcgiserv` の `main()` は起動時に `/home/soramimi/develop/fcgiexample/_bin` へ `chdir()` する前提になっている。そのため、FastCGI アプリ実行パスや相対パス解決は `_bin` 基準で考えること。
+
+## テスト
+
+基本的な結合テストは `test/` 配下にある。
+
+```bash
+# 全テスト実行
+./test/all.sh
+
+# 個別実行
+./test/basic.sh
+./test/error_cases.sh
+./test/websocket.sh
+
+# デバッグトレース付き
+DEBUG=1 ./test/all.sh
+```
+
+- `test/common.sh` にビルド、サーバー起動、後片付け、アサーションの共通処理を集約している。
+- `test/basic.sh` のみ `fcgiapp` も必要とする。`fcgiapp.pro` が更新されていない限り、テスト用 Makefile は再利用される。
+- `test/error_cases.sh` は `curl` に加えて `/dev/tcp` を使い、生の不正 HTTP リクエストも検証する。
+- `test/websocket.sh` は Python 3 標準ライブラリのみで WebSocket ハンドシェイクとエコーを確認する。
 
 ## 主要コンポーネント
 
