@@ -32,7 +32,6 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
-#include "misc.h"
 
 namespace {
 constexpr size_t MAX_CONTENT_LENGTH = 8 * 1024 * 1024; // 8MiB
@@ -80,12 +79,8 @@ size_t count_headers(std::vector<std::string> const &header, std::string_view na
 
 bool is_sensitive_request_header(std::string_view name)
 {
-	return misc::iequals_ascii(name, "Authorization") ||
-		misc::iequals_ascii(name, "Proxy-Authorization") ||
-		misc::iequals_ascii(name, "Cookie") ||
-		misc::iequals_ascii(name, "X-Api-Key");
+	return misc::iequals_ascii(name, "Authorization") || misc::iequals_ascii(name, "Proxy-Authorization") || misc::iequals_ascii(name, "Cookie") || misc::iequals_ascii(name, "X-Api-Key");
 }
-
 
 std::string mask_header_for_log(std::string const &line)
 {
@@ -324,6 +319,7 @@ public:
 				if (buffer.size() < i + 2) return true;
 				payload_length = (static_cast<uint64_t>(p[i]) << 8) | p[i + 1];
 				i += 2;
+				if (payload_length > MAX_WEBSOCKET_MESSAGE_SIZE) return false;
 			} else if (payload_length == 127) {
 				if (buffer.size() < i + 8) return true;
 				payload_length = 0;
@@ -678,6 +674,10 @@ public:
 			printlog(std::string("http thread error: ") + e);
 		} catch (std::string const &e) {
 			printlog(std::string("http thread error: ") + e);
+		} catch (std::exception const &e) {
+			printlog(std::string("http thread error: ") + e.what());
+		} catch (...) {
+			printlog("http thread: unknown exception");
 		}
 	}
 };
