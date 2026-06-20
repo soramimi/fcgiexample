@@ -16,15 +16,19 @@
 #include "base64.h"
 #include "sha1.h"
 #include "strformat.h"
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <mbctype.h>
 #include <shlobj.h>
 #include <direct.h>
 #else
+#include <sys/unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #define strnicmp(A, B, C) strncasecmp(A, B, C)
+#define O_BINARY 0
 #endif
 
 namespace http {
@@ -74,6 +78,23 @@ public:
 		}
 	}
 	std::string const & saved() const { return saved_; }
+};
+
+class AbstractHandler {
+public:
+	virtual ~AbstractHandler() {}
+	virtual http_status_t const *operator () (http_response_t *response) const = 0;
+};
+class HelloHandler : public AbstractHandler {
+public:
+	http_status_t const *operator () (http_response_t *response) const
+	{
+		response->write("Content-Type: text/plain\r\n");
+		response->write("Connection: close\r\n");
+		response->write("\r\n");
+		response->write("Hello, world\r\n");
+		return http200_ok;
+	}
 };
 
 class MyHandler : public HTTP_Handler {
@@ -341,31 +362,31 @@ private:
 		return "application/octet-stream";
 	}
 
-	http_status_t const *serve_static_file(std::string const &normalized_url, http_request_t const *request, http_response_t *response)
+	http_status_t const *serve_static_file(std::string const &path, http_request_t const *request, http_response_t *response)
 	{
 		// Hardcoded document root for the /static/ URL prefix.
-		static std::string const prefix = "/static/";
+		// static std::string const prefix = "/static/";
 		static std::string const root = "/home/soramimi/develop/fcgiexample/static";
 
-		if (normalized_url.size() <= prefix.size() || normalized_url.compare(0, prefix.size(), prefix) != 0) {
-			return nullptr;
-		}
+		// if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) {
+		// 	return nullptr;
+		// }
 
 		if (request->method != RequestMethod::GET) {
 			return http405_method_not_allowed;
 		}
 
-		std::string relpath = normalized_url.substr(prefix.size());
+		std::string relpath = path;
 		if (relpath.empty() || relpath.back() == '/') {
 			return nullptr; // directory listing is not supported -> 404
 		}
 
-		std::string normalized_relpath;
-		if (!misc::normalize_path('/' + relpath, &normalized_relpath)) {
+		auto normalized_relpath = misc::normalize_path('/' + relpath);
+		if (!normalized_relpath) {
 			return nullptr;
 		}
 		// normalized_relpath always starts with '/' because the input did.
-		std::string relative = normalized_relpath.substr(1);
+		std::string relative = normalized_relpath->substr(1);
 		if (relative.empty()) {
 			return nullptr;
 		}
@@ -379,40 +400,35 @@ private:
 			return nullptr;
 		}
 
-		FILE *fp = fopen(fullpath.c_str(), "rb");
-		if (!fp) {
-			return nullptr;
-		}
-		if (fseek(fp, 0, SEEK_END) != 0) {
-			fclose(fp);
-			return nullptr;
-		}
-		long size = ftell(fp);
-		if (size < 0) {
-			fclose(fp);
-			return nullptr;
-		}
-		if (static_cast<size_t>(size) > MAX_STATIC_FILE_SIZE) {
-			fclose(fp);
-			return http413_request_entity_too_large;
-		}
-		fseek(fp, 0, SEEK_SET);
-
-		std::vector<char> body;
-		if (size > 0) {
-			body.resize(static_cast<size_t>(size));
-			if (fread(body.data(), 1, body.size(), fp) != body.size()) {
-				fclose(fp);
-				return nullptr;
+		int fd = open(fullpath.c_str(), O_RDONLY | O_BINARY);
+		if (fd != -1) {
+			bool ok = false;
+			struct stat st;
+			if (fstat(fd, &st) == 0) {
+				if (S_ISREG(st.st_mode)) {
+					if (static_cast<size_t>(st.st_size) <= MAX_STATIC_FILE_SIZE) {
+						char buffer[65536];
+						response->write("Content-Type: " + static_mime_type(relative) + "\r\n\r\n");
+						size_t remaining = st.st_size;
+						while (remaining > 0) {
+							size_t to_read = std::min<size_t>(remaining, sizeof(buffer));
+							ssize_t n = read(fd, buffer, to_read);
+							if (n < 1) {
+								break;
+							}
+							response->write(buffer, n);
+							remaining -= n;
+						}
+						ok = true;
+					}
+				}
+			}
+			close(fd);
+			if (ok) {
+				return http200_ok;
 			}
 		}
-		fclose(fp);
-
-		response->write("Content-Type: " + static_mime_type(relative) + "\r\n\r\n");
-		if (!body.empty()) {
-			response->write(body.data(), body.size());
-		}
-		return http200_ok;
+		return nullptr;
 	}
 
 #pragma pack(push, 1)
@@ -489,8 +505,8 @@ private:
 #ifdef _WIN32
 		char const *cmd = "C:/develop/tinyfcgi/app/tinyfcgi.exe";
 #else
-		// char const *cmd = "./fcgiapp"; // process backend (fork+exec per request)
-		char const *cmd = "unix:/tmp/foo.sock";
+		char const *cmd = "./fcgiapp"; // process backend (fork+exec per request)
+		// char const *cmd = "unix:/tmp/foo.sock";
 		// char const *cmd = "inet:localhost:3000";
 #endif
 
@@ -727,34 +743,65 @@ private:
 		return nullptr;
 	}
 
+private:
+	std::map<std::string, std::function<http_status_t *(http_response_t *response)>> handlers_;
 public:
+	template <typename T> void emplace_handler(std::string const &path, std::function<http_status_t *(HTTPIO *response)> fn)
+	{
+		handlers_.emplace(path, fn);
+	}
+	
 	virtual http_status_t const *do_get(HTTP_Server *server, std::string const &url, http_request_t *request, http_response_t *response, HTTPIO *io)
 	{
-		std::string location = url;
+		std::string path = url;
 		std::string question;
+		std::string sharp;
 		{
-			char const *left = url.c_str();
-			char const *right = strchr(left, '?');
+			char const *left = url.data();
+			char const *right = left + url.size();
+			char const *q = strchr(left, '?');
+			char const *s = strchr(left, '#');
+			if (q) {
+				question = q + 1;
+			}
+			if (s) {
+				sharp = s + 1;
+			}
+			if (q && s) {
+				right = std::min(q, s);
+			} else if (q) {
+				right = q;
+			} else if (s) {
+				right = s;
+			}
 			if (right) {
-				question = right + 1;
 				while (left < right && right[-1] == '/') right--;
-				location.assign(left, right);
+				path.assign(left, right);
 			}
 		}
-		std::string normalized_location;
-		if (!misc::normalize_path(location, &normalized_location)) {
-			return http400_bad_request;
+
+		{
+			std::string_view pathview;
+			auto normalized = misc::normalize_path(path);
+			if (normalized) {
+				pathview = *normalized;
+				while (!pathview.empty() && misc::end_with(pathview, "/")) {
+					pathview.remove_suffix(1);
+				}
+			}
+			if (pathview.empty()) {
+				path = "/index.html";
+			} else {
+				path = pathview;
+			}
 		}
-		if (normalized_location == "/app/") {
+		
+		if (path == "/app") {
 			auto p = invoke_fastcgi(request, response, response);
 			return p ? p : http502_bad_gateway;
-		} else if (normalized_location == "/hello/") {
-			response->write("Content-Type: text/plain\r\n");
-			response->write("Connection: close\r\n");
-			response->write("\r\n");
-			response->write("Hello, world\r\n");
-			return http200_ok;
-		} else if (location == "/sock/") {
+		}
+
+		if (path == "/sock") {
 			std::string sec = request->header_value("Sec-WebSocket-Key");
 			if (!sec.empty()) {
 				sec += "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -777,9 +824,18 @@ public:
 			}
 		}
 
-		http_status_t const *static_status = serve_static_file(normalized_location, request, response);
-		if (static_status) {
-			return static_status;
+		{ // dispatch to user defined handlers
+			auto it = handlers_.find(path);
+			if (it != handlers_.end()) {
+				return it->second.operator ()(response);
+			}
+		}
+		
+		{ // static file serving for unmatched paths
+			http_status_t const *static_status = serve_static_file(path, request, response);
+			if (static_status) {
+				return static_status;
+			}
 		}
 
 		return http404_not_found;
@@ -840,6 +896,13 @@ int main()
 #endif
 
 	MyHandler handler("tinyfcgiserver");
+	handler.emplace_handler<HelloHandler>("/hello", [&](HTTPIO *io){
+		io->write("Content-Type: text/plain\r\n");
+		io->write("Connection: close\r\n");
+		io->write("\r\n");
+		io->write("Hello, world\r\n");
+		return http200_ok;
+	});
 
 	HTTP_Server server(&handler);
 

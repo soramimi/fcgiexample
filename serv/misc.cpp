@@ -86,14 +86,14 @@ void misc::split_words_by_space(std::string const &str, std::vector<std::string>
 	split_(begin, end, [&](char c){ return isspace(c); }, out);
 }
 
-bool misc::normalize_path(std::string const &input, std::string *out)
+std::optional<std::string> misc::normalize_path(std::string const &path)
 {
-	out->clear();
-	if (input.empty()) return false;
+	std::string ret;
+	if (path.empty()) return std::nullopt;
 
 	std::vector<std::string> parts;
-	char const *begin = input.c_str();
-	char const *end = begin + input.size();
+	char const *begin = path.c_str();
+	char const *end = begin + path.size();
 	char const *ptr = begin;
 	char const *left = ptr;
 	while (true) {
@@ -106,7 +106,7 @@ bool misc::normalize_path(std::string const &input, std::string *out)
 				std::string part(left, ptr);
 				if (part == "..") {
 					if (parts.empty()) {
-						return false; // traversal below root
+						return std::nullopt; // traversal below root
 					}
 					parts.pop_back();
 				} else if (part != ".") {
@@ -121,22 +121,38 @@ bool misc::normalize_path(std::string const &input, std::string *out)
 		}
 	}
 
-	if (input[0] == '/') {
-		out->push_back('/');
+	if (path[0] == '/') {
+		ret.push_back('/');
 	}
 	for (size_t i = 0; i < parts.size(); i++) {
-		if (i > 0 || input[0] != '/') {
-			out->push_back('/');
+		if (i > 0 || path[0] != '/') {
+			ret.push_back('/');
 		}
-		out->append(parts[i]);
+		ret.append(parts[i]);
 	}
-	if (out->empty()) {
-		out->push_back('/');
+	if (ret.empty()) {
+		ret.push_back('/');
 	}
 	// Preserve trailing slash so that "/app/" stays "/app/"
-	if (input.size() > 1 && input[input.size() - 1] == '/' && !out->empty() && (*out)[out->size() - 1] != '/') {
-		out->push_back('/');
+	if (path.size() > 1 && path[path.size() - 1] == '/' && !ret.empty() && (ret)[ret.size() - 1] != '/') {
+		ret.push_back('/');
 	}
-	return true;
+	
+	return ret;
 }
 
+bool misc::start_with(std::string_view str, std::string_view with)
+{
+	if (str.size() < with.size()) {
+		return false;
+	}
+	return str.substr(0, with.size()) == with;
+}
+
+bool misc::end_with(std::string_view str, std::string_view with)
+{
+	if (str.size() < with.size()) {
+		return false;
+	}
+	return str.substr(str.size() - with.size(), with.size()) == with;
+}

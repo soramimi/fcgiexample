@@ -4,19 +4,20 @@
 
 #include <string>
 #include <vector>
+#include <optional>
 
-class misc {
-private:
-	misc()
-	{
-	}
-public:
-	static void split_words(char const *begin, char const *end, char c, std::vector<std::string> *out);
-	static void split_words(const std::string &str, char c, std::vector<std::string> *out);
-	static void split_words_by_space(const std::string &str, std::vector<std::string> *out);
-	static int last_index_of(const char *ptr, unsigned short c);
-	static bool normalize_path(const std::string &input, std::string *out);
-};
+namespace misc {
+
+void split_words(char const *begin, char const *end, char c, std::vector<std::string> *out);
+void split_words(const std::string &str, char c, std::vector<std::string> *out);
+void split_words_by_space(const std::string &str, std::vector<std::string> *out);
+int last_index_of(const char *ptr, unsigned short c);
+std::optional<std::string> normalize_path(const std::string &path);
+
+bool start_with(std::string_view str, std::string_view with);
+bool end_with(std::string_view str, std::string_view with);
+
+}
 
 class NameValue {
 private:

@@ -632,11 +632,7 @@ static bool validate_url(std::string const &url)
 	if (url.find("..") != std::string::npos) {
 		return false;
 	}
-	std::string normalized;
-	if (!misc::normalize_path(url, &normalized)) {
-		return false;
-	}
-	return true;
+	return (bool)misc::normalize_path(url);
 }
 
 static std::string make_location(std::string const &url)

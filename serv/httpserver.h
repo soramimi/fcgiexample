@@ -93,9 +93,9 @@ public:
 	{
 		write(text, text + (len == -1 ? strlen(text) : len));
 	}
-	void write(std::string const &str)
+	void write(std::string_view const &str)
 	{
-		char const *begin = str.c_str();
+		char const *begin = str.data();
 		char const *end = begin + str.size();
 		write(begin, end);
 	}
