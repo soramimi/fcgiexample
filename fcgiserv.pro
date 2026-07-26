@@ -11,6 +11,7 @@ DESTDIR = $$PWD/_bin
 unix:LIBS += -lpthread
 
 SOURCES += \
+	misc/ChaCha20.cpp \
 	misc/uuid.cpp \
 	serv/base64.cpp \
 	serv/httpserver.cpp \
@@ -25,6 +26,8 @@ SOURCES += \
 	serv/main.cpp
 
 HEADERS += \
+	misc/ChaCha20.h \
+	misc/jstream.h \
 	misc/uuid.h \
 	serv/base64.h \
 	serv/httpserver.h \

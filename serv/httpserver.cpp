@@ -810,13 +810,13 @@ bool HTTP_Server::run()
 		sin.sin_port = htons(m->tcp_port);
 		// Bind to configured address (default 127.0.0.1 to avoid unintended exposure).
 		// Empty/invalid address falls back to INADDR_ANY only when explicitly requested via "0.0.0.0".
-		if (m->bind_addr.empty() || m->bind_addr == "0.0.0.0") {
-			sin.sin_addr.s_addr = htonl(INADDR_ANY);
-		} else {
-			sin.sin_addr.s_addr = inet_addr(m->bind_addr.c_str());
-			if (sin.sin_addr.s_addr == INADDR_NONE) {
-				throw std::string("invalid bind address");
-			}
+		std::string bind_addr = m->bind_addr;
+		if (bind_addr.empty()) {
+			bind_addr = "127.0.0.1";
+		}
+		sin.sin_addr.s_addr = inet_addr(bind_addr.c_str());
+		if (sin.sin_addr.s_addr == INADDR_NONE) {
+			throw std::string("invalid bind address");
 		}
 
 		if (bind(m->listening_socket, (struct sockaddr *)&sin, sizeof(sin)) < 0) {

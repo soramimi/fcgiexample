@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include "misc/uuid.h"
+#include "misc/jstream.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -272,23 +273,6 @@ bool sanitize_fcgi_response(std::vector<char> const &raw_stdout, http_response_t
 }
 
 }
-
-class AbstractHandler {
-public:
-	virtual ~AbstractHandler() { }
-	virtual http_status_t const *operator()(http_response_t *response) const = 0;
-};
-class HelloHandler : public AbstractHandler {
-public:
-	http_status_t const *operator()(http_response_t *response) const
-	{
-		response->write("Content-Type: text/plain\r\n");
-		response->write("Connection: close\r\n");
-		response->write("\r\n");
-		response->write("Hello, world\r\n");
-		return http200_ok;
-	}
-};
 
 class MyHandler : public HTTP_Handler {
 public:
@@ -747,9 +731,11 @@ private:
 				is_process_backend = true;
 				std::string pipepath;
 				{ // generate pipe path
-					std::string uuid = UUIDv7::generate();
+					char uuidbuf[37];
+					auto uuid = uuidv7();
+					uuid_to_string(uuid.first, uuid.second, uuidbuf);
 					std::string tmp = "/tmp";
-					std::string name = "fcgi_" + uuid + ".sock";
+					std::string name = "fcgi_" + std::string(uuidbuf) + ".sock";
 					pipepath = joinpath(tmp, name);
 				}
 				proc = std::make_shared<FcgiProcess>(pipepath);
@@ -1019,7 +1005,7 @@ private:
 	std::map<std::string, std::function<http_status_t *(http_response_t *response)>> handlers_;
 
 public:
-	template <typename T> void emplace_handler(std::string const &path, std::function<http_status_t *(HTTPIO *response)> fn)
+	void emplace_handler(std::string const &path, std::function<http_status_t *(HTTPIO *response)> fn)
 	{
 		handlers_.emplace(path, fn);
 	}
@@ -1181,7 +1167,6 @@ public:
 	~MyHandler()
 	{
 		unlink(pipepath.c_str());
-		//		pipe.close();
 	}
 };
 
@@ -1202,7 +1187,7 @@ int main()
 #endif
 
 	MyHandler handler("tinyfcgiserver");
-	handler.emplace_handler<HelloHandler>("/hello", [&](HTTPIO *io) {
+	handler.emplace_handler("/hello", [&](HTTPIO *io) {
 		io->write("Content-Type: text/plain\r\n");
 		io->write("Connection: close\r\n");
 		io->write("\r\n");
@@ -1217,6 +1202,7 @@ int main()
 	// #else
 	//	std::string wwwroot = "/home/soramimi/develop/tinyfcgiserver/wwwroot/";
 	// #endif
+	server.setBindAddress("0.0.0.0");
 	server.setPort(5000);
 
 	return server.run() ? 0 : 1;
