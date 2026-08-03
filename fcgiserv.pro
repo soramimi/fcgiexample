@@ -16,6 +16,7 @@ SOURCES += \
 	serv/base64.cpp \
 	serv/httpserver.cpp \
 	serv/httpstatus.cpp \
+	serv/mcp.cpp \
 	serv/misc.cpp \
 	serv/event.cpp \
 	serv/FcgiProcess.cpp \
@@ -27,11 +28,14 @@ SOURCES += \
 
 HEADERS += \
 	misc/ChaCha20.h \
+	misc/fmt.h \
 	misc/jstream.h \
+	misc/toi.h \
 	misc/uuid.h \
 	serv/base64.h \
 	serv/httpserver.h \
 	serv/httpstatus.h \
+	serv/mcp.h \
 	serv/misc.h \
 	serv/sha1.h \
 	serv/socket.h \

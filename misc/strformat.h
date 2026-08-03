@@ -1,11 +1,15 @@
 // String Formatter
-// Copyright (C) 2019 S.Fuchita (soramimi_jp)
+// Copyright (C) 2026 S.Fuchita (soramimi_jp)
 // This software is distributed under the MIT license.
 
 #ifndef STRFORMAT_H
 #define STRFORMAT_H
 
+// #define STRFORMAT_NO_LOCALE
+// #define STRFORMAT_NO_FP
+
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +18,14 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <string_view>
+#include <cstddef>
+#include <limits>
+#include <type_traits>
+
+#ifndef STRFORMAT_NO_LOCALE
+#include <locale.h>
+#endif
 
 #ifdef _MSC_VER
 #include <io.h>
@@ -22,6 +34,291 @@
 #endif
 
 namespace strformat_ns {
+
+class StdAlloc {
+public:
+	void *alloc(size_t size)
+	{
+		return ::malloc(size);
+	}
+	void free(void *ptr)
+	{
+		::free(ptr);
+	}
+};
+
+/**
+ * @brief Fast arena allocator for short-lived formatting data.
+ *
+ * Memory is carved out of a fixed 256-byte in-object buffer first; once it
+ * is exhausted, additional blocks are obtained with `malloc()`.  All blocks
+ * are chained in a singly linked list whose head is the in-object buffer.
+ * `free()` is a no-op: the formatter allocates many small pieces that all
+ * die together, so the heap blocks are released in one sweep by the
+ * destructor instead of being tracked individually.
+ */
+class QuickAlloc {
+private:
+	constexpr static size_t default_buffer_size = 256;
+	constexpr static size_t alignment = alignof(std::max_align_t);
+	// Bookkeeping placed at the top of every block; the block's usable
+	// memory follows immediately after.
+	struct Header {
+		Header *next = nullptr; // singly linked list of blocks
+		size_t capacity = 0;    // usable bytes in this block
+		size_t allocated = 0;   // bytes handed out so far
+	};
+	// First block of the list. Lives inside the allocator object itself
+	// (typically on the stack), so small formatting jobs never touch the heap.
+	alignas(std::max_align_t) char default_buffer[default_buffer_size];
+
+	static_assert(sizeof(default_buffer) > sizeof(Header), "default_buffer too small");
+	
+	void *x_alloc(size_t size)
+	{
+		return ::malloc(size);
+	}
+	void x_free(void *p)
+	{
+		::free(p);
+	}
+	static size_t align_up(size_t n)
+	{
+		return (n + alignment - 1) & ~(alignment - 1);
+	}
+public:
+	QuickAlloc(const QuickAlloc &) = delete;
+	QuickAlloc &operator=(const QuickAlloc &) = delete;
+	QuickAlloc(QuickAlloc &&) = delete;
+	QuickAlloc &operator=(QuickAlloc &&) = delete;
+	QuickAlloc()
+	{
+		Header *h = (Header *)default_buffer;
+		*h = {};
+		h->capacity = sizeof(default_buffer) - sizeof(Header);
+	}
+	~QuickAlloc()
+	{
+		// Release every heap block; the first block is the in-object
+		// buffer and must not be freed.
+		Header *h = (Header *)default_buffer;
+		Header *next = h->next;
+		while (next) {
+			void *p = next;
+			next = next->next;
+			x_free(p);
+		}
+	}
+	/**
+	 * @brief Allocate `size` bytes from the arena.
+	 *
+	 * Only the first two blocks of the list are probed for free space: the
+	 * in-object buffer and, if present, the newest standard heap block.
+	 * The insertion policy below pushes exhausted blocks to third place
+	 * and beyond, and a block only gets displaced after failing a request,
+	 * i.e. when its remaining space is already smaller than that request.
+	 * Blocks past the second therefore have little or no free space left,
+	 * so scanning them would rarely pay off; capping the search keeps
+	 * allocation O(1) no matter how many blocks have accumulated.
+	 *
+	 * When both probes fail, a new block is added:
+	 * - A request that fits in a standard block (`default_buffer_size`
+	 *   bytes including the header) gets one, inserted right behind the
+	 *   in-object buffer so that it becomes the primary heap block for
+	 *   subsequent allocations.
+	 * - A larger request gets a dedicated block sized exactly for it.
+	 *   Such a block is born completely full, so it is inserted behind
+	 *   the current heap block (third place) to keep the two-block search
+	 *   window free of blocks that can never satisfy anything.
+	 *
+	 * Sizes are rounded up to `alignof(std::max_align_t)` granularity, but
+	 * the usable memory starts at offset `sizeof(Header)`, so returned
+	 * pointers are only guaranteed to be aligned to `alignof(Header)`
+	 * (pointer alignment) -- sufficient for the Part records stored here,
+	 * but this is not a general-purpose max-aligned allocator.
+	 */
+	void *alloc(size_t size)
+	{
+		if (size == 0) size = 1;
+		size = align_up(size);
+		Header *h = (Header *)default_buffer;
+		auto Alloc = [&]()-> void * {
+			if (h->allocated + size <= h->capacity) {
+				void *p = (char *)h + sizeof(Header) + h->allocated;
+				h->allocated += size;
+				return p;
+			}
+			return nullptr;
+		};
+		// 1st probe: the in-object buffer
+		void *p = Alloc();
+		if (p) return p;
+		// 2nd probe: the newest heap block, if any
+		if (h->next) {
+			h = h->next;
+			p = Alloc();
+			if (p) return p;
+		}
+		// Both probes failed: allocate a new block. `h` is where the new
+		// block gets linked in (the new block follows `h`).
+		h = (Header *)default_buffer;
+		size_t bufsize = sizeof(Header) + size;
+		if (bufsize < default_buffer_size) {
+			// standard block: insert as the new 2nd block, displacing the
+			// old one out of the search window
+			bufsize = default_buffer_size;
+		} else if (h->next) {
+			// oversized block, exactly filled by this request: insert as
+			// the 3rd block so it never occupies the search window
+			h = h->next;
+		}
+		Header *next = (Header *)x_alloc(bufsize);
+		*next = {};
+		next->capacity = bufsize - sizeof(Header);
+		next->next = h->next;
+		h->next = next;
+		h = next;
+		return Alloc();
+	}
+	void free(void *p)
+	{
+		(void)p;
+		// nop: free all at destructor
+	}
+};
+
+class misc {
+private:
+	/**
+	 * @brief Return 10 raised to an integer power.
+	 *
+	 * A small lookup table is used for the most common range to avoid
+	 * calling the comparatively expensive `pow()` routine.  Values outside
+	 * the table range fall back to `pow(10.0, exp)`.
+	 *
+	 * @param exp Decimal exponent (positive or negative).
+	 * @return The value 10^exp as a double.
+	 */
+	static double pow10_int(int exp)
+	{
+		// Pre‑computed powers for |exp| ≤ 16
+		static const double tbl[] = {
+			1e+00, 1e+01, 1e+02, 1e+03, 1e+04, 1e+05, 1e+06,
+			1e+07, 1e+08, 1e+09, 1e+10, 1e+11, 1e+12, 1e+13,
+			1e+14, 1e+15, 1e+16
+		};
+		if (exp >= 0 && exp < static_cast<int>(sizeof tbl / sizeof *tbl))
+			return tbl[exp];
+		if (exp <= 0 && exp > -static_cast<int>(sizeof tbl / sizeof *tbl))
+			return 1.0 / tbl[-exp];
+		// Rare case: delegate to libm
+		return std::pow(10.0, exp);
+	}
+public:
+	/**
+	 * @brief Locale‑independent `strtod` clone.
+	 *
+	 * Parses a floating‑point literal from a C‑string.  Leading white‑space,
+	 * an optional sign, fractional part (with a mandatory '.' as the decimal
+	 * separator), and an optional exponent (`e`/`E`) are recognised.
+	 *
+	 * The implementation **ignores the current locale**; the decimal point
+	 * must be `'.'` and no thousands separators are accepted.
+	 *
+	 * @param nptr   Pointer to NUL‑terminated text to parse.
+	 * @param endptr If non‑NULL, receives a pointer to the first character
+	 *               following the parsed number (or `nptr` on failure).
+	 * @return The parsed value.
+	 */
+	static double my_strtod(const char *nptr, char **endptr)
+	{
+		const char *s = nptr;
+		bool sign = false;
+		bool saw_digit = false;
+		int frac_digits = 0;
+		long exp_val = 0;
+		bool exp_sign = false;
+		double value = 0.0;
+
+		// Skip leading white‑space
+		while (std::isspace((unsigned char)*s)) ++s;
+
+		// Parse optional sign
+		if (*s == '+' || *s == '-') {
+			if (*s == '-') sign = true;
+			s++;
+		}
+
+		// Integer part
+		while (std::isdigit((unsigned char)*s)) {
+			saw_digit = true;
+			value = value * 10.0 + (*s - '0');
+			s++;
+		}
+
+		// Fractional part
+		if (*s == '.') {
+			s++;
+			while (std::isdigit((unsigned char)*s)) {
+				saw_digit = true;
+				value = value * 10.0 + (*s - '0');
+				s++;
+				frac_digits++;
+			}
+		}
+
+		// No digits at all -> conversion failure
+		if (!saw_digit) {
+			if (endptr) *endptr = const_cast<char *>(nptr);
+			return 0.0;
+		}
+
+		// Exponent part
+		if (*s == 'e' || *s == 'E') {
+			s++;
+			const char *exp_start = s;
+			if (*s == '+' || *s == '-') {
+				if (*s == '-') exp_sign = true;
+				s++;
+			}
+			if (std::isdigit((unsigned char)*s)) {
+				while (std::isdigit((unsigned char)*s)) {
+					exp_val = exp_val * 10 + (*s - '0');
+					s++;
+				}
+				if (exp_sign) {
+					exp_val = -exp_val;
+				}
+			} else {
+				// Roll back if 'e' is not followed by a valid exponent
+				s = exp_start - 1;
+			}
+		}
+
+		// Scale by 10^(exponent − #fractional‑digits)
+		int total_exp = exp_val - frac_digits;
+		if (total_exp != 0) {
+			value *= pow10_int(total_exp);
+		}
+
+		// Apply sign
+		if (sign) {
+			value = -value;
+		}
+
+		// Set errno on overflow/underflow
+		if (!std::isfinite(value)) {
+			// errno = ERANGE;
+			value = sign ? -HUGE_VAL : HUGE_VAL;
+		} else if (value == 0.0 && saw_digit && total_exp != 0) {
+			// errno = ERANGE;  // underflow
+		}
+
+		// Report where parsing stopped
+		if (endptr) *endptr = const_cast<char *>(s);
+		return value;
+	}
+};
 
 struct NumberParser {
 	char const *p;
@@ -40,19 +337,15 @@ struct NumberParser {
 			p++;
 		}
 		if (p[0] == '0') {
-			if (p[1] == 'x') {
+			if (p[1] == 'x' || p[1] == 'X') {
 				p += 2;
 				radix = 16;
 			} else {
 				int i = 1;
-				while (1) {
+				while (p[i]) {
 					int c = (unsigned char)p[i];
-					if (c == '.') {
-						break;
-					}
-					if (!isdigit(c)) {
-						radix = 8;
-					}
+					if (c < '0' || c > '7') break;
+					radix = 8;
 					i++;
 				}
 			}
@@ -64,56 +357,107 @@ template <typename T> static inline T parse_number(char const *ptr, std::functio
 {
 	NumberParser t(ptr);
 	T v = conv(t.p, t.radix);
-	if (t.sign) v = -v;
-	return v;
+	if (t.sign) {
+		if constexpr (std::is_integral_v<T>) {
+			// negate in the unsigned domain to avoid signed overflow on INT_MIN
+			v = static_cast<T>(0 - static_cast<std::make_unsigned_t<T>>(v));
+		} else {
+			v = -v;
+		}
+		return v;
+	} else {
+
+		return v;
+	}
 }
-template <typename T> static inline T num(char const *value);
-template <> inline char num<char>(char const *value)
+
+struct Option_ {
+#ifdef STRFORMAT_NO_LOCALE
+	void *lc = nullptr;
+#else
+	struct lconv *lc = nullptr;
+#endif
+};
+
+template <typename T> static inline T num(char const *value, Option_ const &opt);
+template <> inline char num<char>(char const *value, Option_ const &opt)
 {
+	(void)opt;
 	return parse_number<char>(value, [](char const *p, int radix){
 		return (char)strtol(p, nullptr, radix);
 	});
 }
-template <> inline int32_t num<int32_t>(char const *value)
+template <> inline int32_t num<int32_t>(char const *value, Option_ const &opt)
 {
-	return parse_number<int32_t>(value, [](char const *p, int radix){
-		return strtol(p, nullptr, radix);
-	});
-}
-template <> inline uint32_t num<uint32_t>(char const *value)
-{
+	(void)opt;
 	return parse_number<uint32_t>(value, [](char const *p, int radix){
 		return strtoul(p, nullptr, radix);
 	});
 }
-template <> inline int64_t num<int64_t>(char const *value)
+template <> inline uint32_t num<uint32_t>(char const *value, Option_ const &opt)
 {
-	return parse_number<int64_t>(value, [](char const *p, int radix){
-		return strtoll(p, nullptr, radix);
+	(void)opt;
+	return parse_number<uint32_t>(value, [](char const *p, int radix){
+		return strtoul(p, nullptr, radix);
 	});
 }
-template <> inline uint64_t num<uint64_t>(char const *value)
+template <> inline int64_t num<int64_t>(char const *value, Option_ const &opt)
 {
+	(void)opt;
 	return parse_number<uint64_t>(value, [](char const *p, int radix){
 		return strtoull(p, nullptr, radix);
 	});
 }
-template <> inline double num<double>(char const *value)
+template <> inline uint64_t num<uint64_t>(char const *value, Option_ const &opt)
 {
-	return parse_number<double>(value, [](char const *p, int radix){
+	(void)opt;
+	return parse_number<uint64_t>(value, [](char const *p, int radix){
+		return strtoull(p, nullptr, radix);
+	});
+}
+#ifndef STRFORMAT_NO_FP
+template <> inline double num<double>(char const *value, Option_ const &opt)
+{
+	return parse_number<double>(value, [&opt](char const *p, int radix){
 		if (radix == 10) {
-			return strtod(p, nullptr);
+			if (opt.lc) {
+				// locale-dependent
+				return strtod(p, nullptr);
+			} else {
+				// locale-independent
+				return misc::my_strtod(p, nullptr);
+			}
 		} else {
 			return (double)strtoll(p, nullptr, radix);
 		}
 	});
 }
-template <typename T> static inline T num(std::string const &value)
+#endif
+template <typename T> static inline T num(std::string const &value, Option_ const &opt)
 {
-	return num<T>(value.c_str());
+	return num<T>(value.data(), opt);
 }
 
 class string_formatter {
+public:
+	enum Flags {
+		Locale = 0x0001,
+	};
+	static constexpr int max_precision = 1000;
+private:
+#if 0
+	StdAlloc allocator;
+#else
+	QuickAlloc allocator;
+#endif
+	void *x_alloc(size_t size)
+	{
+		return allocator.alloc(size);
+	}
+	void x_free(void *ptr)
+	{
+		allocator.free(ptr);
+	}
 private:
 	struct Part {
 		Part *next;
@@ -124,31 +468,31 @@ private:
 		Part *head = nullptr;
 		Part *last = nullptr;
 	};
-	static Part *alloc_part(const char *data, int size)
+	Part *alloc_part(const char *data, int size)
 	{
-		Part *p = (Part *)malloc(sizeof(Part) + size);
+		Part *p = (Part *)x_alloc(sizeof(Part) + size);
 		p->next = nullptr;
 		p->size = size;
 		memcpy(p->data, data, size);
 		p->data[size] = 0;
 		return p;
 	}
-	static Part *alloc_part(const char *begin, const char *end)
+	Part *alloc_part(const char *begin, const char *end)
 	{
-		return alloc_part(begin, end - begin);
+		return alloc_part(begin, int(end - begin));
 	}
-	static Part *alloc_part(const char *str)
+	Part *alloc_part(const char *str)
 	{
-		return alloc_part(str, strlen(str));
+		return alloc_part(str, (int)strlen(str));
 	}
-	static Part *alloc_part(const std::string &str)
+	Part *alloc_part(const std::string_view &str)
 	{
-		return alloc_part(str.c_str(), (int)str.size());
+		return alloc_part(str.data(), (int)str.size());
 	}
-	static void free_part(Part **p)
+	void free_part(Part **p)
 	{
 		if (p && *p) {
-			free(*p);
+			x_free(*p);
 			*p = nullptr;
 		}
 	}
@@ -164,7 +508,7 @@ private:
 			list->last = part;
 		}
 	}
-	static void free_list(PartList *list)
+	void free_list(PartList *list)
 	{
 		Part *p = list->head;
 		while (p) {
@@ -175,9 +519,9 @@ private:
 		list->head = nullptr;
 		list->last = nullptr;
 	}
-	static void add_chars(PartList *list, char c, int n)
+	void add_chars(PartList *list, char c, int n)
 	{
-		Part *p = (Part *)malloc(sizeof(Part) + n);
+		Part *p = (Part *)x_alloc(sizeof(Part) + n);
 		p->next = nullptr;
 		p->size = n;
 		memset(p->data, c, n);
@@ -193,50 +537,9 @@ private:
 	{
 		return "0123456789ABCDEF";
 	}
-	static double pow10_(int n)
-	{
-		if (n < 0) {
-			return 1 / pow10_(-n);
-		}
-		if (n < 30) {
-			static const double table[] = {
-				1.0,
-				10.0,
-				100.0,
-				1000.0,
-				10000.0,
-				100000.0,
-				1000000.0,
-				10000000.0,
-				100000000.0,
-				1000000000.0,
-				10000000000.0,
-				100000000000.0,
-				1000000000000.0,
-				10000000000000.0,
-				100000000000000.0,
-				1000000000000000.0,
-				10000000000000000.0,
-				100000000000000000.0,
-				1000000000000000000.0,
-				10000000000000000000.0,
-				100000000000000000000.0,
-				1000000000000000000000.0,
-				10000000000000000000000.0,
-				100000000000000000000000.0,
-				1000000000000000000000000.0,
-				10000000000000000000000000.0,
-				100000000000000000000000000.0,
-				1000000000000000000000000000.0,
-				10000000000000000000000000000.0,
-				100000000000000000000000000000.0,
-			};
-			return table[n];
-		}
-		return pow(10.0, n);
-	}
 	//
-	static Part *format_double(double val, int precision, bool trim_unnecessary_zeros, bool force_sign)
+#ifndef STRFORMAT_NO_FP
+	Part *format_double(double val, int precision, bool trim_zeros, bool plus)
 	{
 		if (std::isnan(val)) return alloc_part("#NAN");
 		if (std::isinf(val)) return alloc_part("#INF");
@@ -244,85 +547,31 @@ private:
 		bool sign = val < 0;
 		if (sign) val = -val;
 
-		if (precision < 0) precision = 0;
+		int bufsize = precision + 400;
+		char *buf = (char *)alloca(bufsize);
+		char *ptr = buf + 1; // reserve buf[0] for sign
 
-		int pt = (val == 0 ? 0 : (int)floor(log10(val))) + 1;
-		val *= pow10_(-pt);
+		auto result = std::to_chars(ptr, buf + bufsize, val, std::chars_format::fixed, precision);
+		char *end = result.ptr;
 
-		int len1 = precision + std::min(pt, 0);
-		int len2 = precision + pt;
-
-		int significant = std::min(len2, 17);
-		double adjust = pow10_(-significant) * 5;
-
-		int len3 = std::max(pt, 0) + precision + 4;
-		char *ptr = (char *)alloca(len3) + 3;
-		char *end = ptr;
-		char *dot = nullptr;
-
-		if (pt < 0) {
-			int n = -pt;
-			if (n > precision) {
-				n = precision;
-			}
-			if (n > 0) {
-				*end++ = '.';
-				for (int i = 0; i < n; i++) {
-					*end++ = '0';
-				}
-				if (len1 > n) {
-					len1 -= n;
-				}
-			}
-		}
-
-		for (int i = 0; i < len2; i++) {
-			if (i == pt) {
-				dot = end;
-				*end++ = '.';
-			}
-			if (i < significant) {
-				val *= 10;
-				double v = floor(val);
-				val -= v;
-				val += adjust;
-				adjust = 0;
-				*end++ = (int)v + '0';
-			} else {
-				*end++ = '0';
-			}
-		}
-
-		if (ptr == end) {
-			*end++ = '0';
-		} else {
-			if (*ptr == '.') {
-				*--ptr = '0';
+		if (trim_zeros) {
+			char *dot = std::find(ptr, end, '.');
+			if (dot != end) {
+				while (end > dot + 1 && end[-1] == '0') end--;
+				if (end[-1] == '.') end--;
 			}
 		}
 
 		if (sign) {
 			*--ptr = '-';
-		} else if (force_sign) {
+		} else if (plus) {
 			*--ptr = '+';
 		}
 
-		if (trim_unnecessary_zeros && dot) {
-			while (dot < end) {
-				char c = end[-1];
-				if (c == '.') {
-					end--;
-					break;
-				}
-				if (c != '0') {
-					break;
-				}
-				end--;
-			}
-		}
 		return alloc_part(ptr, end);
 	}
-	static Part *format_int32(int32_t val, bool force_sign)
+#endif
+	Part *format_int32(int32_t val, bool force_sign)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -332,16 +581,15 @@ private:
 		if (val == 0) {
 			*--ptr = '0';
 		} else {
-			if (val == (int32_t)1 << 31) {
-				*--ptr = '8';
-				val /= 10;
-			}
 			bool sign = (val < 0);
-			if (sign) val = -val;
-
-			while (val != 0) {
-				int c = val % 10 + '0';
-				val /= 10;
+			using U = std::make_unsigned_t<decltype(val)>;
+			U u = (U)val;
+			if (sign) {
+				u = 0u - u;
+			}
+			while (u != 0) {
+				int c = u % 10 + '0';
+				u /= 10;
 				*--ptr = c;
 			}
 			if (sign) {
@@ -353,7 +601,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_uint32(uint32_t val)
+	Part *format_uint32(uint32_t val)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -372,7 +620,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_int64(int64_t val, bool force_sign)
+	Part *format_int64(int64_t val, bool force_sign)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -382,16 +630,16 @@ private:
 		if (val == 0) {
 			*--ptr = '0';
 		} else {
-			if (val == (int64_t)1 << 63) {
-				*--ptr = '8';
-				val /= 10;
-			}
 			bool sign = (val < 0);
-			if (sign) val = -val;
+			using U = std::make_unsigned_t<decltype(val)>;
+			U u = (U)val;
+			if (sign) {
+				u = 0u - u;
+			}
 
-			while (val != 0) {
-				int c = val % 10 + '0';
-				val /= 10;
+			while (u != 0) {
+				int c = u % 10 + '0';
+				u /= 10;
 				*--ptr = c;
 			}
 			if (sign) {
@@ -403,7 +651,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_uint64(uint64_t val)
+	Part *format_uint64(uint64_t val)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -422,7 +670,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_oct32(uint32_t val)
+	Part *format_oct32(uint32_t val)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -443,7 +691,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_oct64(uint64_t val)
+	Part *format_oct64(uint64_t val)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -464,7 +712,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_hex32(uint32_t val, bool upper)
+	Part *format_hex32(uint32_t val, bool upper)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -485,7 +733,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_hex64(uint64_t val, bool upper)
+	Part *format_hex64(uint64_t val, bool upper)
 	{
 		int n = 30;
 		char *end = (char *)alloca(n) + n - 1;
@@ -506,7 +754,7 @@ private:
 
 		return alloc_part(ptr, end);
 	}
-	static Part *format_pointer(void *val)
+	Part *format_pointer(void *val)
 	{
 		int n = sizeof(uintptr_t) * 2 + 1;
 		char *end = (char *)alloca(n) + n - 1;
@@ -525,57 +773,69 @@ private:
 		return alloc_part(ptr, end);
 	}
 private:
-	std::string text_;
-	char const *head_;
-	char const *next_;
-	PartList list_;
-	bool upper_ : 1;
-	bool zero_padding_ : 1;
-	bool align_left_ : 1;
-	bool force_sign_ : 1;
-	int width_;
-	int precision_;
-	int lflag_;
+	struct Private {
+		std::string_view text;
+		char const *head;
+		char const *next;
+		PartList list;
+		bool upper : 1;
+		bool zero_padding : 1;
+		bool align_left : 1;
+		bool plus : 1;
+		int width = 0;
+		int precision;
+		int lflag;
+		Option_ opt;
+	} q;
+
+	void _init()
+	{
+		q.list = {};
+	}
 
 	void clear()
 	{
-		free_list(&list_);
+		free_list(&q.list);
 	}
 	bool advance(bool complete)
 	{
 		bool r = false;
 		auto Flush = [&](){
-			if (head_ < next_) {
-				Part *p = alloc_part(head_, next_);
-				add_part(&list_, p);
-				head_ = next_;
+			if (q.head < q.next) {
+				Part *p = alloc_part(q.head, q.next);
+				add_part(&q.list, p);
+				q.head = q.next;
 			}
 		};
-		while (*next_) {
-			if (*next_ == '%') {
-				if (next_[1] == '%') {
-					next_++;
+		char const *end = q.text.data() + q.text.size();
+		while (q.next < end) {
+			if (*q.next == '%') {
+				if (q.next[1] == '%') {
+					q.next++;
 					Flush();
-					next_++;
-					head_ = next_;
+					q.next++;
+					q.head = q.next;
 				} else if (complete) {
-					next_++;
+					q.next++;
 				} else {
 					r = true;
 					break;
 				}
 			} else {
-				next_++;
+				q.next++;
 			}
 		}
 		Flush();
 		return r;
 	}
-	Part *format_f(double value, bool trim_unnecessary_zeros)
+#ifndef STRFORMAT_NO_FP
+	Part *format_f(double value, bool trim_zeros)
 	{
-		int pr = precision_ < 0 ? 6 : precision_;
-		return format_double(value, pr, trim_unnecessary_zeros, force_sign_);
+		int pr = q.precision < 0 ? 6 : q.precision;
+		if (pr > max_precision) pr = max_precision;
+		return format_double(value, pr, trim_zeros, q.plus);
 	}
+#endif
 	Part *format_c(char c)
 	{
 		return alloc_part(&c, &c + 1);
@@ -588,7 +848,9 @@ private:
 			case 'd': return format((int32_t)value, 0);
 			case 'u': return format(value, 0);
 			case 'x': return format_x32(value, 0);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
 		return format_oct32(value);
@@ -601,7 +863,9 @@ private:
 			case 'd': return format((int64_t)value, 0);
 			case 'u': return format(value, 0);
 			case 'x': return format_x64(value, 0);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
 		return format_oct64(value);
@@ -614,10 +878,12 @@ private:
 			case 'd': return format((int32_t)value, 0);
 			case 'u': return format(value, 0);
 			case 'o': return format_o32(value, 0);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
-		return format_hex32(value, upper_);
+		return format_hex32(value, q.upper);
 	}
 	Part *format_x64(uint64_t value, int hint)
 	{
@@ -627,15 +893,18 @@ private:
 			case 'd': return format((int64_t)value, 0);
 			case 'u': return format(value, 0);
 			case 'o': return format_o64(value, 0);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
-		return format_hex64(value, upper_);
+		return format_hex64(value, q.upper);
 	}
 	Part *format(char c, int hint)
 	{
 		return format((int32_t)c, hint);
 	}
+#ifndef STRFORMAT_NO_FP
 	Part *format(double value, int hint)
 	{
 		if (hint) {
@@ -650,6 +919,7 @@ private:
 		}
 		return format_f(value, false);
 	}
+#endif
 	Part *format(int32_t value, int hint)
 	{
 		if (hint) {
@@ -658,10 +928,12 @@ private:
 			case 'u': return format((uint32_t)value, 0);
 			case 'o': return format_o32((uint32_t)value, 0);
 			case 'x': return format_x32((uint32_t)value, 0);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
-		return format_int32(value, force_sign_);
+		return format_int32(value, q.plus);
 	}
 	Part *format(uint32_t value, int hint)
 	{
@@ -671,7 +943,9 @@ private:
 			case 'd': return format((int32_t)value, 0);
 			case 'o': return format_o32((uint32_t)value, 0);
 			case 'x': return format_x32((uint32_t)value, 0);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
 		return format_uint32(value);
@@ -684,10 +958,12 @@ private:
 			case 'u': return format((uint64_t)value, 0);
 			case 'o': return format_o64((uint64_t)value, 0);
 			case 'x': return format_x64((uint64_t)value, 0);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
-		return format_int64(value, force_sign_);
+		return format_int64(value, q.plus);
 	}
 	Part *format(uint64_t value, int hint)
 	{
@@ -697,7 +973,9 @@ private:
 			case 'd': return format((int64_t)value, 0);
 			case 'o': return format_oct64(value);
 			case 'x': return format_hex64(value, false);
+#ifndef STRFORMAT_NO_FP
 			case 'f': return format((double)value, 0);
+#endif
 			}
 		}
 		return format_uint64(value);
@@ -710,80 +988,96 @@ private:
 		if (hint) {
 			switch (hint) {
 			case 'c':
-				return format_c(num<char>(value));
+				return format_c(num<char>(value, q.opt));
 			case 'd':
-				if (lflag_ == 0) {
-					return format(num<int32_t>(value), 0);
+				if (q.lflag == 0) {
+					return format(num<int32_t>(value, q.opt), 0);
 				} else {
-					return format(num<int64_t>(value), 0);
+					return format(num<int64_t>(value, q.opt), 0);
 				}
 			case 'u': case 'o': case 'x':
-				if (lflag_ == 0) {
-					return format(num<uint32_t>(value), hint);
+				if (q.lflag == 0) {
+					return format(num<uint32_t>(value, q.opt), hint);
 				} else {
-					return format(num<uint64_t>(value), hint);
+					return format(num<uint64_t>(value, q.opt), hint);
 				}
+#ifndef STRFORMAT_NO_FP
 			case 'f':
-				return format(num<double>(value), hint);
+				return format(num<double>(value, q.opt), hint);
+#endif
 			}
 		}
 		return alloc_part(value, value + strlen(value));
 	}
-	Part *format(std::string const &value, int hint)
+	Part *format(std::string_view const &value, int hint)
 	{
 		if (hint == 's') {
 			return alloc_part(value);
 		}
-		return format(value.c_str(), hint);
+		return format(value.data(), hint);
+	}
+	Part *format(std::vector<char> const &value, int hint)
+	{
+		std::string_view sv(value.data(), value.size());
+		if (hint == 's') {
+			return alloc_part(sv);
+		}
+		return format(sv, hint);
 	}
 	Part *format_p(void *val)
 	{
 		return format_pointer(val);
 	}
+	void reset_format_params()
+	{
+		q.upper = false;
+		q.zero_padding = false;
+		q.align_left = false;
+		q.plus = false;
+		q.width = -1;
+		q.precision = -1;
+		q.lflag = 0;
+	}
 	void format(std::function<Part *(int)> const &callback, int width, int precision)
 	{
 		if (advance(false)) {
-			if (*next_ == '%') {
-				next_++;
+			if (*q.next == '%') {
+				q.next++;
 			}
 
-			upper_ = false;
-			zero_padding_ = false;
-			align_left_ = false;
-			force_sign_ = false;
-			width_ = -1;
-			precision_ = -1;
-			lflag_ = 0;
+			reset_format_params();
 
 			while (1) {
-				int c = (unsigned char)*next_;
+				int c = (unsigned char)*q.next;
 				if (c == '0') {
-					zero_padding_ = true;
+					q.zero_padding = true;
 				} else if (c == '+') {
-					force_sign_ = true;
+					q.plus = true;
 				} else if (c == '-') {
-					align_left_ = true;
+					q.align_left = true;
 				} else {
 					break;
 				}
-				next_++;
+				q.next++;
 			}
 
 			auto GetNumber = [&](int alternate_value){
 				int value = -1;
-				if (*next_ == '*') {
-					next_++;
+				if (*q.next == '*') {
+					q.next++;
 				} else {
 					while (1) {
-						int c = (unsigned char)*next_;
+						int c = (unsigned char)*q.next;
 						if (!isdigit(c)) break;
 						if (value < 0) {
 							value = 0;
-						} else {
-							value *= 10;
 						}
-						value += c - '0';
-						next_++;
+						if (value <= (std::numeric_limits<int>::max() - (c - '0')) / 10) {
+							value = value * 10 + (c - '0');
+						} else {
+							value = std::numeric_limits<int>::max();
+						}
+						q.next++;
 					}
 				}
 				if (value < 0) {
@@ -792,128 +1086,157 @@ private:
 				return value;
 			};
 
-			width_ = GetNumber(width);
+			q.width = GetNumber(width);
 
-			if (*next_ == '.') {
-				next_++;
+			if (*q.next == '.') {
+				q.next++;
 			}
 
-			precision_ = GetNumber(precision);
+			q.precision = GetNumber(precision);
 
-			while (*next_ == 'l') {
-				lflag_++;
-				next_++;
+			while (*q.next == 'l') {
+				q.lflag++;
+				q.next++;
 			}
 
 			Part *p = nullptr;
 
-			int c = (unsigned char)*next_;
+			int c = (unsigned char)*q.next;
 			if (isupper(c)) {
-				upper_ = true;
+				q.upper = true;
 				c = tolower(c);
 			}
 			if (isalpha(c)) {
 				p = callback(c);
-				next_++;
+				q.next++;
 			}
 			if (p) {
-				int padlen = width_ - p->size;
-				if (padlen > 0 && !align_left_) {
-					if (zero_padding_) {
+				int padlen = q.width - p->size;
+				if (padlen > 0 && !q.align_left) {
+					if (q.zero_padding) {
 						char c = p->data[0];
-						add_chars(&list_, '0', padlen);
+						add_chars(&q.list, '0', padlen);
 						if (c == '+' || c == '-') {
-							list_.last->data[0] = c;
+							q.list.last->data[0] = c;
 							p->data[0] = '0';
 						}
 					} else {
-						add_chars(&list_, ' ', padlen);
+						add_chars(&q.list, ' ', padlen);
 					}
 				}
 
-				add_part(&list_, p);
+				add_part(&q.list, p);
 
-				if (padlen > 0 && align_left_) {
-					add_chars(&list_, ' ', padlen);
+				if (padlen > 0 && q.align_left) {
+					add_chars(&q.list, ' ', padlen);
 				}
 			}
 
-			head_ = next_;
+			q.head = q.next;
 		}
 	}
 	int length()
 	{
 		advance(true);
 		int len = 0;
-		for (Part *p = list_.head; p; p = p->next) {
+		for (Part *p = q.list.head; p; p = p->next) {
 			len += p->size;
 		}
 		return len;
 	}
-public:
-	string_formatter() = delete;
-	string_formatter(string_formatter &&) = delete;
-	string_formatter(string_formatter const &) = delete;
-	void operator = (string_formatter &&) = delete;
-	void operator = (string_formatter const &) = delete;
-
-	string_formatter(std::string const &text)
-		: text_(text)
+#ifndef STRFORMAT_NO_LOCALE
+	void use_locale(bool use)
 	{
-		reset();
+		if (use) {
+			q.opt.lc = localeconv();
+		} else {
+			q.opt.lc = nullptr;
+		}
+	}
+#endif
+	void set_flags(int flags)
+	{
+		(void)flags;
+#ifndef STRFORMAT_NO_LOCALE
+		use_locale(flags & Locale);
+#endif
+	}
+public:
+	string_formatter(string_formatter const &) = delete;
+	void operator = (string_formatter const &) = delete;
+	string_formatter(string_formatter &&r) = delete;
+	void operator = (string_formatter &&r) = delete;
+
+	string_formatter(int flags = 0, std::string_view text = {})
+	{
+		reset(flags, text);
+	}
+
+	string_formatter(std::string_view text)
+	{
+		reset(0, text);
 	}
 	~string_formatter()
 	{
 		clear();
 	}
 
-	string_formatter &reset()
+	char decimal_point() const
 	{
+#ifndef STRFORMAT_NO_LOCALE
+		if (q.opt.lc && q.opt.lc->decimal_point) {
+			return *q.opt.lc->decimal_point;
+		}
+#endif
+		return '.';
+	}
+
+	string_formatter &reset(int flags, std::string_view text)
+	{
+		(void)flags;
 		clear();
-		head_ = text_.c_str();
-		next_ = head_;
+		q.text = text.empty() ? std::string_view("") : text;
+		q.head = q.text.data();
+		q.next = q.head;
+		reset_format_params();
+
+#ifndef STRFORMAT_NO_LOCALE
+		use_locale(flags & Locale);
+#endif
+
 		return *this;
 	}
 
-	string_formatter &append(std::string const &s)
-	{
-		text_ += s;
-		return *this;
-	}
-	string_formatter &append(char const *s)
-	{
-		text_ += s;
-		return *this;
-	}
-
-	template <typename T> string_formatter &a(T const &value, int width = -1, int precision = -1)
+	template <typename T> string_formatter &arg(T const &value, int width = -1, int precision = -1)
 	{
 		format([&](int hint){ return format(value, hint); }, width, precision);
 		return *this;
 	}
+#ifndef STRFORMAT_NO_FP
 	string_formatter &f(double value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
+#endif
 	string_formatter &c(char value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
 	string_formatter &d(int32_t value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
 	string_formatter &ld(int64_t value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
 	string_formatter &u(uint32_t value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
 	string_formatter &lu(uint64_t value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
 	string_formatter &o(int32_t value, int width = -1, int precision = -1)
 	{
@@ -937,11 +1260,11 @@ public:
 	}
 	string_formatter &s(char const *value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
-	string_formatter &s(std::string const &value, int width = -1, int precision = -1)
+	string_formatter &s(std::string_view const &value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
 	string_formatter &p(void *value, int width = -1, int precision = -1)
 	{
@@ -951,21 +1274,14 @@ public:
 
 	template <typename T> string_formatter &operator () (T const &value, int width = -1, int precision = -1)
 	{
-		return a(value, width, precision);
+		return arg(value, width, precision);
 	}
 	void render(std::function<void (char const *ptr, int len)> const &to)
 	{
 		advance(true);
-		for (Part *p = list_.head; p; p = p->next) {
+		for (Part *p = q.list.head; p; p = p->next) {
 			to(p->data, p->size);
 		}
-	}
-	void vec(std::vector<char> *vec)
-	{
-		vec->reserve(vec->size() + length());
-		render([&](char const *ptr, int len){
-			vec->insert(vec->end(), ptr, ptr + len);
-		});
 	}
 	void write_to(FILE *fp)
 	{
@@ -979,7 +1295,7 @@ public:
 			::write(fd, ptr, len);
 		});
 	}
-	void out()
+	void put()
 	{
 		write_to(stdout);
 	}
@@ -987,16 +1303,34 @@ public:
 	{
 		write_to(stderr);
 	}
+	void append_to(std::vector<char> *vec)
+	{
+		vec->reserve(vec->size() + length());
+		render([&](char const *ptr, int len){
+			vec->insert(vec->end(), ptr, ptr + len);
+		});
+	}
+	void append_to(std::string *str)
+	{
+		str->reserve(str->size() + length());
+		render([&](char const *ptr, int len){
+			str->append(ptr, len);
+		});
+	}
+	std::vector<char> vec()
+	{
+		std::vector<char> ret;
+		append_to(&ret);
+		return ret;
+	}
 	std::string str()
 	{
-		int n = length();
-		char *p = (char *)alloca(n);
-		char *d = p;
+		std::string result;
+		result.reserve(length());
 		render([&](char const *ptr, int len){
-			memcpy(d, ptr, len);
-			d += len;
+			result.append(ptr, len);
 		});
-		return std::string(p, n);
+		return result;
 	}
 	operator std::string ()
 	{
@@ -1005,7 +1339,5 @@ public:
 };
 
 } // namespace strformat_ns
-
-using strformat = strformat_ns::string_formatter;
 
 #endif // STRFORMAT_H

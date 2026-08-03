@@ -9,10 +9,13 @@
 #include "socket.h"
 #include "strformat.h"
 #include <algorithm>
+#include <chrono>
 #include <ctype.h>
 #include <fcntl.h>
 #include <list>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +24,7 @@
 #include <vector>
 #include "misc/uuid.h"
 #include "misc/jstream.h"
+#include "mcp.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -272,6 +276,122 @@ bool sanitize_fcgi_response(std::vector<char> const &raw_stdout, http_response_t
 	return true;
 }
 
+
+mcp::McpRequest mcp_parse_request(std::vector<char> const &content)
+{
+	mcp::McpRequest req;
+	jstream::Reader r(content.data(), content.size());
+	while (r.next()) {
+		if (r.match("{method")) {
+			req.method = r.string();
+		} else if (r.match("{params{protocolVersion")) {
+			req.params.protocolVersion = r.string();
+		} else if (r.match("{params{name")) {
+			req.params.name = r.string();
+		} else if (r.match("{params{capabilities{experimental")) {
+			// empty
+		} else if (r.match("{params{capabilities{prompts{listChanged")) {
+			req.params.capabilities.prompts.listChanged = r.boolean();
+		} else if (r.match("{params{capabilities{resources{subscribe")) {
+			req.params.capabilities.resources.subscribe = r.boolean();
+		} else if (r.match("{params{capabilities{resources{listChanged")) {
+			req.params.capabilities.resources.listChanged = r.boolean();
+		} else if (r.match("{params{capabilities{tools{listChanged")) {
+			req.params.capabilities.tools.listChanged = r.boolean();
+		} else if (r.match("{params{serverInfo{name")) {
+			req.params.serverInfo.name = r.string();
+		} else if (r.match("{params{serverInfo{version")) {
+			req.params.serverInfo.version = r.string();
+		} else if (r.match("{params{clientInfo{name")) {
+			req.params.clientInfo.name = r.string();
+		} else if (r.match("{params{clientInfo{version")) {
+			req.params.clientInfo.version = r.string();
+		} else if (r.match("{params{arguments{*")) {
+			if (r.is_value()) {
+				mcp::McpRequest::Params::Argument arg;
+				arg.name = r.key();
+				arg.value = r.string();
+				req.params.arguments.push_back(arg);
+			}
+		} else if (r.match("{jsonrpc")) {
+			req.jsonrpc = r.string();
+		} else if (r.match("{id")) {
+			if (r.isstring()) {
+				req.id.kind = mcp::McpId::Kind::String;
+				req.id.str = r.string();
+			} else if (r.isnumber()) {
+				req.id.kind = mcp::McpId::Kind::Number;
+				req.id.number = r.number();
+			} else if (r.isnull()) {
+				req.id.kind = mcp::McpId::Kind::Null;
+			}
+		}
+	}
+	return req;
+}
+
+// Writes a JSON-RPC error object inside this endpoint's usual SSE envelope.
+// The HTTP layer stays 200; the failure is carried in the JSON-RPC payload,
+// per the MCP Streamable HTTP convention of only using HTTP-level error codes
+// for transport-level problems (bad session, bad Origin, etc).
+http_status_t const *mcp_send_jsonrpc_error(http_response_t *response, mcp::McpId const &id, int code, std::string const &message, std::string const &session_id = {})
+{
+	jstream::Writer w;
+	w.enable_indent(false);
+	w.enable_newline(false);
+	w.object({}, [&](){
+		w.string("jsonrpc", "2.0");
+		mcp_write_id(w, id);
+		w.object("error", [&](){
+			w.number("code", code);
+			w.string("message", message);
+		});
+	});
+	std::string json = w;
+	if (!session_id.empty()) {
+		response->write("mcp-session-id: " + session_id + "\r\n");
+	}
+	response->write("\r\n");
+	response->write("event: message\r\n");
+	response->write("data:" + json + "\r\n\r\n");
+	return http200_ok;
+}
+
+// DNS-rebinding mitigation: browsers always send Origin; non-browser MCP
+// clients (curl, SDKs) typically omit it, so a missing header is allowed.
+bool mcp_origin_allowed(std::string const &origin)
+{
+	if (origin.empty()) {
+		return true;
+	}
+	std::string rest = origin;
+	size_t scheme_pos = rest.find("://");
+	if (scheme_pos != std::string::npos) {
+		rest = rest.substr(scheme_pos + 3);
+	}
+	std::string host;
+	for (char ch : rest) {
+		if (ch == ':' || ch == '/') break;
+		host += ch;
+	}
+	return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+}
+
+// Session ids are always server-generated hex strings; reject anything else
+// outright instead of using attacker-controlled text as a map key.
+bool mcp_session_id_well_formed(std::string const &id)
+{
+	if (id.empty() || id.size() > 64) {
+		return false;
+	}
+	for (char ch : id) {
+		if (!isxdigit(static_cast<unsigned char>(ch))) {
+			return false;
+		}
+	}
+	return true;
+}
+
 }
 
 class MyHandler : public HTTP_Handler {
@@ -286,6 +406,16 @@ private:
 	std::string pipepath;
 	std::shared_ptr<AbstractFcgi> proc;
 	bool proc_expired = false; // true when proc is a fork-based backend that must re-launch next time
+
+	// 128 bits of CSPRNG-backed uuidv7 output, hex-encoded; unrelated to any
+	// client-supplied identifier so sessions can never be fixated by a client.
+	static std::string mcp_generate_session_id()
+	{
+		auto pair = uuidv7();
+		char tmp[33];
+		snprintf(tmp, sizeof(tmp), "%016llx%016llx", (unsigned long long)pair.first, (unsigned long long)pair.second);
+		return std::string(tmp, 32);
+	}
 
 	struct ContentType {
 		std::string mime;
@@ -1012,7 +1142,7 @@ public:
 
 	virtual http_status_t const *do_get(HTTP_Server * /*server*/, std::string const &url, http_request_t *request, http_response_t *response, HTTPIO * /*io*/)
 	{
-		printlog("do_get url=" + url);
+		// printlog("do_get url=" + url);
 		std::string path = url;
 		std::string question;
 		std::string sharp;
@@ -1062,7 +1192,7 @@ public:
 			return p ? p : http502_bad_gateway;
 		}
 
-		printlog("do_get path=" + path);
+		// printlog("do_get path=" + path);
 		if (path == "/sock") {
 			printlog("matched /sock");
 			std::string upgrade = request->header_value("Upgrade");
@@ -1100,6 +1230,14 @@ public:
 			}
 		}
 
+		if (path == "/mcp") {
+			// GET is not part of this server's Streamable HTTP support (no server-initiated
+			// SSE stream / session resumption). Leave response.content empty so the normal
+			// 4xx auto-body filler produces a proper Content-Type + body instead of a bare
+			// Content-Length: 0 response.
+			return http400_bad_request;
+		}
+
 		{ // dispatch to user defined handlers
 			auto it = handlers_.find(path);
 			if (it != handlers_.end()) {
@@ -1116,27 +1254,205 @@ public:
 
 		return http404_not_found;
 	}
-
+	
+	static std::string make_chunk(std::string const &content)
+	{
+		char tmp[10];
+		sprintf(tmp, "%x\r\n", (int)content.size());
+		return tmp + content;
+	}
+	
+	static std::string make_event_message(std::string const &content)
+	{
+		std::string data;
+		data += "event: message\r\n";
+		data += "data:" + content + "\r\n\r\n";
+		return make_chunk(data);
+	}
+	
+	std::string mcp_protocol_version() const
+	{
+		return "2025-11-25";
+	}
+	
+	mcp::Tool tool_;
+	
+	http_status_t const *on_mcp_initialize(mcp::McpRequest const &req, http_response_t *response)
+	{
+		if (req.params.protocolVersion.empty()) {
+			return mcp_send_jsonrpc_error(response, req.id, -32602, "Invalid params: protocolVersion is required");
+		}
+		
+		std::string mcp_session_id = mcp_generate_session_id();
+		
+		std::string json;
+		jstream::Writer w;
+		w.enable_indent(false);
+		w.enable_newline(false);
+		w.object({}, [&](){
+			w.string("jsonrpc", "2.0");
+			mcp_write_id(w, req.id);
+			w.object("result", [&](){
+				w.string("protocolVersion", mcp_protocol_version());
+				w.object("capabilities", [&](){
+					w.object("experimental", [&](){});
+					w.object("prompts", [&](){
+						w.boolean("listChanged", false);
+					});
+					w.object("resources", [&](){
+						w.boolean("subscribe", false);
+						w.boolean("listChanged", false);
+					});
+					w.object("tools", [&](){
+						w.boolean("listChanged", false);
+					});
+				});
+				w.object("serverInfo", [&](){
+					w.string("name", "Demo2");
+					w.string("version", "1.28.1");
+				});
+			});
+		});
+		json = w;
+		response->write("mcp-session-id: " + mcp_session_id + "\r\n");
+		
+		response->write("Transfer-Encoding: chunked\r\n");
+		response->write("\r\n");
+		
+		std::string chunk = make_event_message(json);
+		
+		response->write(chunk);
+		
+		response->write("\r\n");
+		response->write("0\r\n");
+		response->write("\r\n");
+		return http200_ok;
+	}
+	
+	http_status_t const *on_mcp_notifications_initialized(std::string const &mcp_session_id, http_response_t *response)
+	{
+		response->write("\r\n");
+		return http202_accepted;
+	}
+	
+	http_status_t const *on_mcp_tools_list(mcp::McpRequest const &req, std::string const &mcp_session_id, http_response_t *response)
+	{
+		std::string json = tool_.tools_list_json(req);
+		response->write("mcp-session-id: " + mcp_session_id + "\r\n");
+		response->write("\r\n");
+		response->write("event: message\r\n");
+		response->write("data:" + json + "\r\n\r\n");
+		return http200_ok;
+	}
+	
+	http_status_t const *on_mcp_tools_call(mcp::McpRequest const &req, std::string const &mcp_session_id, http_response_t *response)
+	{
+		auto opt1 = tool_.find_function(req.params.name);
+		if (opt1) {
+			mcp::Function const &func = *opt1;
+			mcp::McpRequest::Params::Argument const *arg_a = req.find_argument("a");
+			mcp::McpRequest::Params::Argument const *arg_b = req.find_argument("b");
+			std::vector<std::string> args;
+			args.push_back(arg_a ? arg_a->value : "0");
+			args.push_back(arg_b ? arg_b->value : "0");
+			auto opt2 = func.call({}, args);
+			std::string answer = opt2 ? *opt2 : "";
+			
+			jstream::Writer w;
+			w.enable_indent(false);
+			w.enable_newline(false);
+			w.object({}, [&](){
+				w.string("jsonrpc", "2.0");
+				mcp_write_id(w, req.id);
+				w.object("result", [&](){
+					w.array("content", [&](){
+						w.object({}, [&](){
+							w.string("type", "text");
+							w.string("text", answer);
+						});
+					});
+					w.object("structuredContent", [&](){
+						w.string("result", answer);
+					});
+					w.boolean("isError", false);
+				});
+			});
+			std::string json = w;
+			response->write("mcp-session-id: " + mcp_session_id + "\r\n");
+			response->write("\r\n");
+			response->write("event: message\r\n");
+			response->write("data:" + json + "\r\n\r\n");
+			return http200_ok;
+		}
+		return mcp_send_jsonrpc_error(response, req.id, -32602, "Invalid params: unknown tool '" + req.params.name + "'", mcp_session_id);
+	}
+	
 	virtual http_status_t const *do_post(HTTP_Server * /*server*/, std::string const &url, http_request_t *request, http_response_t *response, HTTPIO * /*io*/)
 	{
+		std::vector<char> post_content;
+		request->read_content(&post_content, 100000000);
+		
 		// POST is only accepted by the FastCGI backend; all other resources are GET-only.
 		char const *left = url.data();
 		char const *right = left + url.size();
 		char const *q = strchr(left, '?');
 		char const *s = strchr(left, '#');
-		if (q && s)
+		if (q && s) {
 			right = std::min(q, s);
-		else if (q)
+		} else if (q) {
 			right = q;
-		else if (s)
+		} else if (s) {
 			right = s;
-		while (left < right && right[-1] == '/')
+		}
+		while (left < right && right[-1] == '/') {
 			right--;
+		}
 		std::string path(left, right);
 		if (path == "/app") {
 			auto p = invoke_fastcgi(request, response, response);
 			return p ? p : http502_bad_gateway;
 		}
+
+		if (path == "/mcp") {
+			// DNS-rebinding mitigation: reject cross-origin browser requests outright.
+			if (!mcp_origin_allowed(request->header_value("Origin"))) {
+				return http403_forbidden;
+			}
+
+			mcp::McpRequest req = mcp_parse_request(post_content);
+
+			response->write("Content-Type: text/event-stream\r\n");
+
+			if (req.jsonrpc != "2.0" || req.method.empty()) {
+				return mcp_send_jsonrpc_error(response, req.id, -32600, "Invalid Request");
+			}
+
+			if (req.method == "initialize") {
+				return on_mcp_initialize(req, response);
+			}
+
+			// Every other method requires a previously-issued, still-live session.
+			std::string mcp_session_id = request->header_value("mcp-session-id");
+			if (!mcp_session_id_well_formed(mcp_session_id)) {
+				return http400_bad_request;
+			}
+			
+			if (req.method == "notifications/initialized") {
+				return on_mcp_notifications_initialized(mcp_session_id, response);
+			}
+
+			if (req.method == "tools/list") {
+				return on_mcp_tools_list(req, mcp_session_id, response);
+			}
+
+			if (req.method == "tools/call") {
+				return on_mcp_tools_call(req, mcp_session_id, response);
+			}
+
+			return mcp_send_jsonrpc_error(response, req.id, -32601, "Method not found: " + req.method, mcp_session_id);
+		}
+
+
 		return http405_method_not_allowed;
 	}
 
@@ -1203,7 +1519,7 @@ int main()
 	//	std::string wwwroot = "/home/soramimi/develop/tinyfcgiserver/wwwroot/";
 	// #endif
 	server.setBindAddress("0.0.0.0");
-	server.setPort(5000);
+	server.setPort(9000);
 
 	return server.run() ? 0 : 1;
 }

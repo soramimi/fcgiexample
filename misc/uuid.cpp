@@ -1,10 +1,12 @@
 #include "uuid.h"
 #include "ChaCha20.h"
 #include <chrono>
+#include <mutex>
 
 namespace {
 
 ChaCha20 rng;
+std::mutex rng_mutex; // ChaCha20 keeps mutable internal state and is not safe to call from multiple threads concurrently.
 
 inline uint64_t now_us()
 {
@@ -15,6 +17,7 @@ inline uint64_t now_us()
 
 inline uint32_t rand_u32()
 {
+	std::lock_guard<std::mutex> lock(rng_mutex);
 	return rng.next_u32();
 }
 

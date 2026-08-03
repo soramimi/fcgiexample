@@ -97,7 +97,24 @@ std::string mask_header_for_log(std::string const &line)
 	return masked;
 }
 
+static std::string header_value(std::vector<std::string> const &header, std::string const &name)
+{
+	for (std::vector<std::string>::const_iterator it = header.begin(); it != header.end(); it++) {
+		if (strnicmp(it->c_str(), name.c_str(), name.size()) == 0 && it->c_str()[name.size()] == ':') {
+			char const *left = it->c_str();
+			char const *right = left + it->size();
+			left += name.size() + 1;
+			while (left < right && isspace(left[0] & 0xff))
+				left++;
+			while (left < right && isspace(right[-1] & 0xff))
+				right--;
+			return std::string(left, right);
+		}
+	}
+	return std::string();
 }
+
+} // namespace
 
 std::string SocketBuffer::readline()
 {
@@ -577,7 +594,19 @@ public:
 							char const *end = begin + response.content.size();
 							char const *ptr = parse_header(begin, end, &header);
 							int len = end - ptr;
-							if (status != http101_switching_protocols) {
+							bool contentlength = true;
+							bool chunked = false;
+							{
+								std::string val = header_value(header, "Transfer-Encoding");
+								if (val == "chunked") {
+									contentlength = false;
+									chunked = true;
+								}
+							}
+							if (status == http101_switching_protocols) {
+								contentlength = false;
+							}
+							if (contentlength) {
 								char tmp[100];
 								sprintf(tmp, "Content-Length: %u", len);
 								header.push_back(tmp);
@@ -587,8 +616,50 @@ public:
 							}
 							if (!server->http_send_response_header(sockbuff.sock, status, header)) {
 								sockbuff.connected = false;
-							} else if (status != http101_switching_protocols && !send_all(sockbuff.sock, ptr, len)) {
-								sockbuff.connected = false;
+							} else if (status != http101_switching_protocols) {
+								bool ok = false;
+								if (0 && chunked) {
+									size_t left = 0;
+									size_t right = 0;
+									size_t chunk_size = 0;
+									bool chunk_header = true;
+									while (right < len) {
+										int c = (unsigned char)ptr[right];
+										if (chunk_header) {
+											right++;
+											if (c == '\r') continue;
+											if (!isxdigit(c)) {
+												chunk_header = false;
+												continue;
+											}
+											chunk_size = chunk_size * 16 + (isdigit(c) ? (c - '0') : (tolower(c) - 'a' + 10));
+										} else {
+											right += chunk_size;
+											if (right < len && ptr[right] == '\r') {
+												right++;
+											} else {
+												break;
+											}
+											if (right < len && ptr[right] == '\n') {
+												right++;
+											} else {
+												break;
+											}
+											if (right <= len) {
+												ok = send_all(sockbuff.sock, ptr + left, right - left);
+												if (!ok) break;
+											}
+											left = right;
+											chunk_size = 0;
+											chunk_header = true;
+										}
+									}
+								} else {
+									ok = send_all(sockbuff.sock, ptr, len);
+								}
+								if (!ok) {
+									sockbuff.connected = false;
+								}
 							}
 						}
 
@@ -740,7 +811,11 @@ http_status_t const *HTTP_Server::http_process_request(HTTP_Thread *thread, http
 		}
 		response->content.clear();
 		response->content.reserve(65536);
-		return m->http_handler->do_get(this, request->uri, request, response, io);
+		if (request->method == RequestMethod::GET) {
+			return m->http_handler->do_get(this, request->uri, request, response, io);
+		} else if (request->method == RequestMethod::POST) {
+			return m->http_handler->do_post(this, request->uri, request, response, io);
+		}
 	}
 	return http405_method_not_allowed;
 }
@@ -836,10 +911,10 @@ bool HTTP_Server::run()
 
 		int threadcount = 8;
 		threads.resize(threadcount);
-		for (int i = 0; i < threadcount; i++) {
+		for (int i = 0; i < threads.size(); i++) {
 			threads[i].setup(this);
 		}
-		for (int i = 0; i < threadcount; i++) {
+		for (int i = 0; i < threads.size(); i++) {
 			threads[i].start();
 		}
 
@@ -863,7 +938,7 @@ bool HTTP_Server::run()
 			}
 		}
 
-		for (int i = 0; i < threadcount; i++) {
+		for (int i = 0; i < threads.size(); i++) {
 			threads[i].stop();
 			threads[i].join();
 		}
@@ -879,26 +954,12 @@ bool HTTP_Server::run()
 
 std::string http_request_t::header_value(std::string const &name) const
 {
-	for (std::vector<std::string>::const_iterator it = header.begin(); it != header.end(); it++) {
-		if (strnicmp(it->c_str(), name.c_str(), name.size()) == 0 && it->c_str()[name.size()] == ':') {
-			char const *left = it->c_str();
-			char const *right = left + it->size();
-			left += name.size() + 1;
-			while (left < right && isspace(left[0] & 0xff))
-				left++;
-			while (left < right && isspace(right[-1] & 0xff))
-				right--;
-			return std::string(left, right);
-		}
-	}
-	return std::string();
+	return ::header_value(header, name);
 }
 
 void http_request_t::read_content(std::vector<char> *out, size_t maxlen)
 {
-	if (maxlen == 0) {
-		maxlen = content_length;
-	}
-	sockbuff->read(out, maxlen);
+	size_t len = std::min(maxlen, content_length);
+	sockbuff->read(out, len);
 	content_consumed = true;
 }
