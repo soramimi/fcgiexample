@@ -21,7 +21,7 @@ void mcp::mcp_write_id(jstream::Writer &w, const McpId &id)
 	}
 }
 
-std::string mcp::Tool::make_tools_list_json(const Tool &tool, const McpRequest &req)
+std::string mcp::Tools::make_tools_list_json(const Tools &tool, const McpRequest &req)
 {
 	jstream::Writer w;
 	w.enable_indent(false);
@@ -31,39 +31,39 @@ std::string mcp::Tool::make_tools_list_json(const Tool &tool, const McpRequest &
 		mcp_write_id(w, req.id);
 		w.object("result", [&](){
 			w.array("tools", [&](){
-				for (auto const &func : tool.functions()) {
+				for (AbstractTool *func : tool.functions()) {
+					ToolSchema const &schema = func->schema();
 					w.object({}, [&](){
-						w.string("name", func.name());
-						w.string("description", func.description());
+						w.string("name", schema.name);
+						w.string("description", schema.description);
 						w.object("inputSchema", [&](){
 							w.object("properties", [&](){
-								for (auto const &prop : func.input_properties()) {
+								for (auto const &prop : schema.input_properties) {
 									w.object(prop.name, [&](){
 										w.string("type", prop.type);
 									});
 								}
 							});
 							w.array("required", [&](){
-								w.string("a");
-								w.string("b");
+								for (auto const &prop : schema.input_properties) {
+									w.string(prop.name);
+								}
 							});
-							mcp::Property const &t = func.input_title();
-							w.string("title", t.name);
-							w.string("type", t.type);
+							w.string("title", "Input");
+							w.string("type", "object");
 						});
 						w.object("outputSchema", [&](){
 							w.object("properties", [&](){
-								w.object(func.output_property().name, [&](){
-									w.string("title", "Result");
-									w.string("type", "number");
+								w.object(schema.output_property.name, [&](){
+									w.string("title", schema.output_property.title);
+									w.string("type", schema.output_property.type);
 								});
 							});
 							w.array("required", [&](){
-								w.string("result");
+								w.string(schema.output_property.name);
 							});
-							mcp::Property const &t = func.output_title();
-							w.string("title", t.name);
-							w.string("type", t.type);
+							w.string("title", "Output");
+							w.string("type", "object");
 						});
 					});
 				}
@@ -71,4 +71,10 @@ std::string mcp::Tool::make_tools_list_json(const Tool &tool, const McpRequest &
 		});
 	});
 	return w;
+}
+
+void mcp::Tools::install_function(const std::shared_ptr<AbstractTool> &tool)
+{
+	std::string name = tool->schema().name;
+	functions_[name] = tool;
 }

@@ -902,6 +902,8 @@ bool HTTP_Server::run()
 		if (ret == -1) {
 			throw std::string("listen");
 		}
+		
+		printlog(strformat("HTTP server listening on %s:%u").s(bind_addr).u(m->tcp_port).str());
 
 #ifndef _WIN32
 		install_termination_handlers();

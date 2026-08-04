@@ -6,12 +6,12 @@
 #include <optional>
 #include <misc/toi.h>
 #include <misc/fmt.h>
+#include <map>
 #include <memory>
 
 namespace jstream { class Writer; }
 
 namespace mcp {
-
 
 struct McpId {
 	enum class Kind { Missing, Number, String, Null };
@@ -79,102 +79,83 @@ struct McpRequest {
 
 struct Property {
 	std::string name;
+	std::string title;
 	std::string type;
 	Property() = default;
-	Property(std::string const &name, std::string const &type)
+	Property(std::string const &name, std::string title, std::string const &type)
 		: name(name)
+		, title(title)
 		, type(type)
 	{
 	}
 };
-class AbstractFunction {
-public:
-	virtual ~AbstractFunction() = default;
-	virtual std::string name() const = 0;
-	virtual std::string description() const = 0;
-	virtual Property input_title() const = 0;
-	virtual Property output_title() const = 0;
-	virtual std::vector<Property> const &input_properties() const = 0;
-	virtual Property const &output_property() const = 0;
-};
-class Function : public AbstractFunction {
-private:
-	std::string name_;
-	std::string description_;
-	Property input_title_;
-	Property output_title_;
-	std::vector<Property> input_properties_;
-	Property output_property_;
-public:
-	Function()
-		: name_("add")
-		, description_("Add two numbers")
-	{
-		input_title_ = Property("addArguments", "object");
-		output_title_ = Property("addOutput", "object");
-		input_properties_.emplace_back("a", "number");
-		input_properties_.emplace_back("b", "number");
-		output_property_ = Property("result", "number");
-	}
-	std::string name() const override
-	{
-		return name_;
-	}
-	std::string description() const override
-	{
-		return description_;
-	}
-	Property input_title() const override
-	{
-		return input_title_;
-	}
-	Property output_title() const override
-	{
-		return output_title_;
-	}
-	std::vector<Property> const &input_properties() const override
-	{
-		return input_properties_;
-	}
-	Property const &output_property() const override
-	{
-		return output_property_;
-	}
-	std::optional<std::string> call(std::shared_ptr<void> context, std::vector<std::string> const &args) const
-	{
-		if (args.size() != 2) return std::nullopt;
-		int a = toi<int>(args[0]);
-		int b = toi<int>(args[1]);
-		int ans = a + b;
-		return fmt("%d")(ans);
-	}
+
+struct ToolSchema {
+	std::string name;
+	std::string description;
+	std::vector<Property> input_properties;
+	Property output_property;
 };
 
-class Tool {
+class AbstractTool {
 private:
-	std::vector<Function> functions_;
-	static std::string make_tools_list_json(mcp::Tool const &tool, McpRequest const &req);
+	ToolSchema schema_;
+protected:
 public:
-	Tool()
+	ToolSchema &schema()
 	{
-		functions_.emplace_back();
+		return schema_;
 	}
-	std::vector<Function> const &functions() const
+	ToolSchema const &schema() const
 	{
-		return functions_;
+		return schema_;
 	}
-	std::optional<Function> find_function(std::string const &name) const
+public:
+	virtual ~AbstractTool() = default;
+	AbstractTool(std::string const &name, std::string const &description)
 	{
-		for (const auto &func : functions_) {
-			if (func.name() == name) {
-				return func;
-			}
+		schema_.name = name;
+		schema_.description = description;
+		schema_.output_property = Property("result", "Result", "string");
+	}
+	void add_property(std::string name, std::string title, std::string type)
+	{
+		schema_.input_properties.emplace_back(name, title, type);
+	}
+	virtual std::optional<std::string> call(std::shared_ptr<void> context, std::vector<std::string> const &args) const = 0;
+};
+
+class Tools {
+private:
+	std::map<std::string, std::shared_ptr<AbstractTool>> functions_;
+	
+	static std::string make_tools_list_json(mcp::Tools const &tool, McpRequest const &req);
+public:
+	std::vector<AbstractTool *> functions() const
+	{
+		std::vector<AbstractTool *> result;
+		for (const auto &pair : functions_) {
+			result.push_back(pair.second.get());
 		}
-		return std::nullopt;
+		return result;
+	}
+	std::shared_ptr<AbstractTool> find_function(std::string const &name) const
+	{
+		auto it = functions_.find(name);
+		if (it != functions_.end()) {
+			return it->second;
+		}
+		return nullptr;
 	}
 	std::string tools_list_json(McpRequest const &req)
 	{
 		return make_tools_list_json(*this, req);
+	}
+	
+	void install_function(std::shared_ptr<AbstractTool> const &tool);	
+	template <typename T, typename... Args> void emplace_tool(Args&&...args)
+	{
+		install_function(std::make_shared<T>(std::forward<Args>(args)...));
 	}
 };
 

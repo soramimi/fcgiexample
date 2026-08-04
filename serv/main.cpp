@@ -1275,7 +1275,7 @@ public:
 		return "2025-11-25";
 	}
 	
-	mcp::Tool tool_;
+	mcp::Tools tool_;
 	
 	http_status_t const *on_mcp_initialize(mcp::McpRequest const &req, http_response_t *response)
 	{
@@ -1349,13 +1349,13 @@ public:
 	{
 		auto opt1 = tool_.find_function(req.params.name);
 		if (opt1) {
-			mcp::Function const &func = *opt1;
+			mcp::AbstractTool *func = opt1.get();
 			mcp::McpRequest::Params::Argument const *arg_a = req.find_argument("a");
 			mcp::McpRequest::Params::Argument const *arg_b = req.find_argument("b");
 			std::vector<std::string> args;
 			args.push_back(arg_a ? arg_a->value : "0");
 			args.push_back(arg_b ? arg_b->value : "0");
-			auto opt2 = func.call({}, args);
+			auto opt2 = func->call({}, args);
 			std::string answer = opt2 ? *opt2 : "";
 			
 			jstream::Writer w;
@@ -1484,6 +1484,29 @@ public:
 	{
 		unlink(pipepath.c_str());
 	}
+	
+	template <typename T, typename... Args> void emplace_tool(Args&&...args)
+	{
+		tool_.install_function(std::make_shared<T>(std::forward<Args>(args)...));
+	}
+};
+
+class mcptool_add : public mcp::AbstractTool {
+public:
+	mcptool_add()
+		: AbstractTool("add", "Add two numbers")
+	{
+		add_property("a", "A", "number");
+		add_property("b", "B", "number");
+	}
+	std::optional<std::string> call(std::shared_ptr<void> context, std::vector<std::string> const &args) const
+	{
+		if (args.size() != 2) return std::nullopt;
+		int a = toi<int>(args[0]);
+		int b = toi<int>(args[1]);
+		int ans = a + b;
+		return fmt("%d")(ans);
+	}
 };
 
 int main()
@@ -1510,7 +1533,9 @@ int main()
 		io->write("Hello, world\r\n");
 		return http200_ok;
 	});
-
+	
+	handler.emplace_tool<mcptool_add>();
+	
 	HTTP_Server server(&handler);
 
 	// #ifdef _WIN32
