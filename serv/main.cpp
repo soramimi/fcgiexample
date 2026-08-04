@@ -1230,7 +1230,8 @@ public:
 			}
 		}
 
-		if (path == "/mcp") {
+		auto it = tools_.find(path);
+		if (it != tools_.end()) {
 			// GET is not part of this server's Streamable HTTP support (no server-initiated
 			// SSE stream / session resumption). Leave response.content empty so the normal
 			// 4xx auto-body filler produces a proper Content-Type + body instead of a bare
@@ -1275,7 +1276,7 @@ public:
 		return "2025-11-25";
 	}
 	
-	mcp::Tools tool_;
+	std::map<std::string, mcp::Tools> tools_;
 	
 	http_status_t const *on_mcp_initialize(mcp::McpRequest const &req, http_response_t *response)
 	{
@@ -1335,9 +1336,9 @@ public:
 		return http202_accepted;
 	}
 	
-	http_status_t const *on_mcp_tools_list(mcp::McpRequest const &req, std::string const &mcp_session_id, http_response_t *response)
+	http_status_t const *on_mcp_tools_list(mcp::Tools const &tools, mcp::McpRequest const &req, std::string const &mcp_session_id, http_response_t *response)
 	{
-		std::string json = tool_.tools_list_json(req);
+		std::string json = tools.tools_list_json(req);
 		response->write("mcp-session-id: " + mcp_session_id + "\r\n");
 		response->write("\r\n");
 		response->write("event: message\r\n");
@@ -1345,9 +1346,9 @@ public:
 		return http200_ok;
 	}
 	
-	http_status_t const *on_mcp_tools_call(mcp::McpRequest const &req, std::string const &mcp_session_id, http_response_t *response)
+	http_status_t const *on_mcp_tools_call(mcp::Tools const &tools, mcp::McpRequest const &req, std::string const &mcp_session_id, http_response_t *response)
 	{
-		auto opt1 = tool_.find_function(req.params.name);
+		auto opt1 = tools.find_function(req.params.name);
 		if (opt1) {
 			mcp::AbstractTool *func = opt1.get();
 			mcp::McpRequest::Params::Argument const *arg_a = req.find_argument("a");
@@ -1413,7 +1414,10 @@ public:
 			return p ? p : http502_bad_gateway;
 		}
 
-		if (path == "/mcp") {
+		auto it = tools_.find(path);
+		if (it != tools_.end()) {
+			mcp::Tools const &tools = it->second;
+			
 			// DNS-rebinding mitigation: reject cross-origin browser requests outright.
 			if (!mcp_origin_allowed(request->header_value("Origin"))) {
 				return http403_forbidden;
@@ -1442,16 +1446,15 @@ public:
 			}
 
 			if (req.method == "tools/list") {
-				return on_mcp_tools_list(req, mcp_session_id, response);
+				return on_mcp_tools_list(tools, req, mcp_session_id, response);
 			}
 
 			if (req.method == "tools/call") {
-				return on_mcp_tools_call(req, mcp_session_id, response);
+				return on_mcp_tools_call(tools, req, mcp_session_id, response);
 			}
 
 			return mcp_send_jsonrpc_error(response, req.id, -32601, "Method not found: " + req.method, mcp_session_id);
 		}
-
 
 		return http405_method_not_allowed;
 	}
@@ -1485,9 +1488,9 @@ public:
 		unlink(pipepath.c_str());
 	}
 	
-	template <typename T, typename... Args> void emplace_tool(Args&&...args)
+	template <typename T, typename... Args> void install_mcp_tool(std::string const &path, Args&&...args)
 	{
-		tool_.install_function(std::make_shared<T>(std::forward<Args>(args)...));
+		tools_[path].install_mcp_tool(std::make_shared<T>(std::forward<Args>(args)...));
 	}
 };
 
@@ -1496,8 +1499,8 @@ public:
 	mcptool_add()
 		: AbstractTool("add", "Add two numbers")
 	{
-		add_property("a", "A", "number");
-		add_property("b", "B", "number");
+		add_argument("a", "A", "number");
+		add_argument("b", "B", "number");
 	}
 	std::optional<std::string> call(std::shared_ptr<void> context, std::vector<std::string> const &args) const
 	{
@@ -1534,7 +1537,7 @@ int main()
 		return http200_ok;
 	});
 	
-	handler.emplace_tool<mcptool_add>();
+	handler.install_mcp_tool<mcptool_add>("/mcp");
 	
 	HTTP_Server server(&handler);
 

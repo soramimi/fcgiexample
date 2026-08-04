@@ -118,7 +118,7 @@ public:
 		schema_.description = description;
 		schema_.output_property = Property("result", "Result", "string");
 	}
-	void add_property(std::string name, std::string title, std::string type)
+	void add_argument(std::string name, std::string title, std::string type)
 	{
 		schema_.input_properties.emplace_back(name, title, type);
 	}
@@ -147,15 +147,15 @@ public:
 		}
 		return nullptr;
 	}
-	std::string tools_list_json(McpRequest const &req)
+	std::string tools_list_json(McpRequest const &req) const
 	{
 		return make_tools_list_json(*this, req);
 	}
 	
-	void install_function(std::shared_ptr<AbstractTool> const &tool);	
+	void install_mcp_tool(std::shared_ptr<AbstractTool> const &tool);	
 	template <typename T, typename... Args> void emplace_tool(Args&&...args)
 	{
-		install_function(std::make_shared<T>(std::forward<Args>(args)...));
+		install_mcp_tool(std::make_shared<T>(std::forward<Args>(args)...));
 	}
 };
 

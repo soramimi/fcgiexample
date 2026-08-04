@@ -73,7 +73,7 @@ std::string mcp::Tools::make_tools_list_json(const Tools &tool, const McpRequest
 	return w;
 }
 
-void mcp::Tools::install_function(const std::shared_ptr<AbstractTool> &tool)
+void mcp::Tools::install_mcp_tool(const std::shared_ptr<AbstractTool> &tool)
 {
 	std::string name = tool->schema().name;
 	functions_[name] = tool;
