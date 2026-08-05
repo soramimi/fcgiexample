@@ -3,11 +3,11 @@
 #include "base64.h"
 #include "debug.h"
 #include "httpserver.h"
-#include "joinpath.h"
+#include <misc/joinpath.h>
 #include "misc.h"
 #include "sha1.h"
 #include "socket.h"
-#include "strformat.h"
+#include <misc/fmt.h>
 #include <algorithm>
 #include <chrono>
 #include <ctype.h>
@@ -626,7 +626,7 @@ private:
 			setEnvironment(out, "REQUEST_METHOD", "POST");
 		}
 
-		setEnvironment(out, "SERVER_PROTOCOL", strformat("%s/%u.%u").s(request->protocol).u(request->protocol_version.maj).u(request->protocol_version.min).str());
+		setEnvironment(out, "SERVER_PROTOCOL", fmt("%s/%u.%u")(request->protocol)(request->protocol_version.maj)(request->protocol_version.min));
 		setEnvironment(out, "GATEWAY_INTERFACE", "CGI/1.1");
 		setEnvironment(out, "REQUEST_URI", request->uri);
 		{
@@ -641,7 +641,7 @@ private:
 			}
 		}
 		if (request->content_length > 0) {
-			setEnvironment(out, "CONTENT_LENGTH", strformat("%u").u(request->content_length).str());
+			setEnvironment(out, "CONTENT_LENGTH", fmt("%u")(request->content_length));
 		}
 	}
 
@@ -1508,7 +1508,7 @@ public:
 		int a = toi<int>(args[0]);
 		int b = toi<int>(args[1]);
 		int ans = a + b;
-		return fmt("%d")(ans);
+		return fmt("%d")(ans).str();
 	}
 };
 

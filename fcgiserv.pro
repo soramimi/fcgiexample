@@ -21,15 +21,15 @@ SOURCES += \
 	serv/event.cpp \
 	serv/FcgiProcess.cpp \
 	serv/sha1.c \
-	serv/thread.cpp \
 	serv/debug.cpp \
-	serv/joinpath.cpp \
 	serv/main.cpp
 
 HEADERS += \
 	misc/ChaCha20.h \
 	misc/fmt.h \
+	misc/joinpath.h \
 	misc/jstream.h \
+	misc/strformat.h \
 	misc/toi.h \
 	misc/uuid.h \
 	serv/base64.h \
@@ -42,7 +42,4 @@ HEADERS += \
 	serv/event.h \
 	serv/mutex.h \
 	serv/FcgiProcess.h \
-	serv/strformat.h \
-	serv/thread.h \
-	serv/debug.h \
-	serv/joinpath.h
+	serv/debug.h

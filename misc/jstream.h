@@ -1126,11 +1126,6 @@ public:
 		return symbol() == True;
 	}
 
-	bool boolean() const
-	{
-		return istrue();
-	}
-
 	bool isnumber() const
 	{
 		return state() == Number;
@@ -1144,6 +1139,11 @@ public:
 	double number() const
 	{
 		return d.number;
+	}
+
+	bool boolean() const
+	{
+		return istrue();
 	}
 
 	bool isarray() const
@@ -1593,10 +1593,7 @@ struct Array {
 		assert(i < a.size());
 		return std::get<T>(a[i]);
 	}
-	void push_back(Variant const &v)
-	{
-		a.push_back(v);
-	}
+	void push_back(Variant const &v);
 	Array &operator += (Variant const &v)
 	{
 		push_back(v);
@@ -1612,6 +1609,10 @@ struct KeyValue {
 	{
 	}
 };
+inline void Array::push_back(const Variant &v)
+{
+	a.push_back(v);
+}
 struct VariantRef {
 	Variant *var;
 	VariantRef(Variant &v)

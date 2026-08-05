@@ -8,6 +8,7 @@
 #include <misc/fmt.h>
 #include <map>
 #include <memory>
+#include <variant>
 
 namespace jstream { class Writer; }
 
@@ -95,6 +96,44 @@ struct ToolSchema {
 	std::string description;
 	std::vector<Property> input_properties;
 	Property output_property;
+};
+
+struct Variant {
+private:
+	std::variant<double, std::string> var_;
+public:
+	Variant() = default;
+	Variant(double d)
+		: var_(d)
+	{
+	}
+	Variant(std::string const &s)
+		: var_(s)
+	{
+	}
+	bool is_number() const
+	{
+		return std::holds_alternative<double>(var_);
+	}
+	bool is_string() const
+	{
+		return std::holds_alternative<std::string>(var_);
+	}
+	double as_number() const
+	{
+		if (std::holds_alternative<double>(var_)) {
+			return std::get<double>(var_);
+		}
+		if (std::holds_alternative<std::string>(var_)) {
+			return toi<double>(std::get<std::string>(var_));
+		}
+		return 0;
+	}
+	std::string const &as_string() const
+	{
+		return std::get<std::string>(var_);
+	}
+	
 };
 
 class AbstractTool {

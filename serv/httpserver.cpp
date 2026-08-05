@@ -14,13 +14,14 @@
 #include <sys/stat.h>
 #define O_BINARY 0
 #define strnicmp(A, B, C) strncasecmp(A, B, C)
+#define INVALID_SOCKET (-1)
 #endif
 
 #include "debug.h"
 #include "httpserver.h"
-#include "joinpath.h"
+#include <misc/joinpath.h>
 #include "misc.h"
-#include "strformat.h"
+#include <misc/fmt.h>
 #include "thread.h"
 #include <algorithm>
 #include <limits>
@@ -410,34 +411,75 @@ struct HTTP_Server::Private {
 	std::string bind_addr;
 	socket_t listening_socket;
 
+	std::thread thread;
+
 	HTTP_Handler *http_handler;
 
 	RequestHandlerMap request_handler_map;
 };
 
-class WebSocketThread : public Thread {
+class WebSocketThread {
 public:
-	int sock = -1;
-	virtual void run()
+	std::thread thread_;
+	~WebSocketThread()
 	{
-		while (true) {
-			char buf[65536];
-			int n = read(sock, buf, sizeof(buf));
-			if (n < 1) break;
-			printlog(strformat("ws thread read %u bytes").u(n).str());
+		stop();
+	}
+	WebSocketThread() = default;
+	WebSocketThread(WebSocketThread const &r) = delete;
+	int sock = -1;
+	void start()
+	{
+		thread_ = std::thread([this]() {
+			while (true) {
+				char buf[65536];
+				int n = read(sock, buf, sizeof(buf));
+				if (n < 1) break;
+				printlog(fmt("ws thread read %u bytes")(n));
+			}
+		});
+	}
+	void stop()
+	{
+		if (thread_.joinable()) {
+			thread_.join();
 		}
 	}
 };
 
-class HTTP_Thread : public Thread {
+class HTTP_Thread {
+private:
+	HTTP_Server *server_ = nullptr;
+	std::thread thread_;
+	SocketBuffer sockbuff_;
 public:
-	HTTP_Server *server;
-	SocketBuffer sockbuff;
-	void setup(HTTP_Server *s)
+	~HTTP_Thread()
 	{
-		server = s;
+		stop();
 	}
-	virtual void run()
+	HTTP_Thread() = default;
+	HTTP_Thread(HTTP_Thread &&r)
+		: server_(r.server_)
+		, thread_(std::move(r.thread_))
+		, sockbuff_(std::move(r.sockbuff_))
+	{
+		r.server_ = nullptr;
+	}
+	
+	void start(HTTP_Server *s)
+	{
+		thread_ = std::thread([this](HTTP_Server *s) {
+			this->server_ = s;
+			this->run();
+		}, s);
+	}
+	void stop()
+	{
+		if (thread_.joinable()) {
+			thread_.join();
+		}
+	}
+	void run()
 	{
 		try {
 			while (1) {
@@ -448,14 +490,14 @@ public:
 				socket_t connected_socket = -1;
 				// Retry accept() on EINTR (signal interruption)
 				while (true) {
-					connected_socket = accept(server->m->listening_socket, (struct sockaddr *)&peer_sin, &len);
+					connected_socket = accept(server_->m->listening_socket, (struct sockaddr *)&peer_sin, &len);
 					if (connected_socket != -1) break;
 					if (errno == EINTR) continue;
 					if (
 #ifndef _WIN32
 						g_shutdown_requested ||
 #endif
-						server->m->listening_socket == -1) {
+						server_->m->listening_socket == -1) {
 						return;
 					}
 					throw "accept failed";
@@ -466,34 +508,34 @@ public:
 				// Disable Nagle to ensure small interactive frames (101 headers, WS control frames) are sent immediately.
 				set_tcp_nodelay(connected_socket);
 
-				sockbuff.clear();
-				sockbuff.sock = connected_socket;
-				sockbuff.connected = true;
+				sockbuff_.clear();
+				sockbuff_.sock = connected_socket;
+				sockbuff_.connected = true;
 
 				bool web_socket_upgraded = false;
-				while (sockbuff.connected) {
+				while (sockbuff_.connected) {
 					http_request_t request;
-					request.sockbuff = &sockbuff;
+					request.sockbuff = &sockbuff_;
 					http_status_t const *status = nullptr;
 					size_t total_header_size = 0;
 
-					while (sockbuff.connected) {
-						std::string line = sockbuff.readline();
+					while (sockbuff_.connected) {
+						std::string line = sockbuff_.readline();
 						if (line.empty()) {
-							if (!sockbuff.connected) {
+							if (!sockbuff_.connected) {
 								status = http400_bad_request;
 							}
 							break;
 						}
 						total_header_size += line.size() + 2; // include \r\n
-						if (total_header_size > sockbuff.max_header_total_length) {
+						if (total_header_size > sockbuff_.max_header_total_length) {
 							status = http400_bad_request;
-							sockbuff.connected = false;
+							sockbuff_.connected = false;
 							break;
 						}
 						request.header.push_back(line);
 					}
-					if ((request.header.size() > 0 || status) && sockbuff.connected) {
+					if ((request.header.size() > 0 || status) && sockbuff_.connected) {
 						http_response_t response;
 						if (!request.header.empty()) {
 							std::vector<std::string> first;
@@ -570,7 +612,7 @@ public:
 						}
 						if (!status) {
 							HTTPIO *io = &response;
-							status = server->http_process_request(this, &request, &response, io);
+							status = server_->http_process_request(this, &request, &response, io);
 							if (!status) {
 								status = http500_internal_server_error;
 							}
@@ -614,8 +656,8 @@ public:
 							if (response.keepalive == ConnectionType::KeepAlive) {
 								header.push_back("Connection: keep-alive");
 							}
-							if (!server->http_send_response_header(sockbuff.sock, status, header)) {
-								sockbuff.connected = false;
+							if (!server_->http_send_response_header(sockbuff_.sock, status, header)) {
+								sockbuff_.connected = false;
 							} else if (status != http101_switching_protocols) {
 								bool ok = false;
 								if (0 && chunked) {
@@ -646,7 +688,7 @@ public:
 												break;
 											}
 											if (right <= len) {
-												ok = send_all(sockbuff.sock, ptr + left, right - left);
+												ok = send_all(sockbuff_.sock, ptr + left, right - left);
 												if (!ok) break;
 											}
 											left = right;
@@ -655,10 +697,10 @@ public:
 										}
 									}
 								} else {
-									ok = send_all(sockbuff.sock, ptr, len);
+									ok = send_all(sockbuff_.sock, ptr, len);
 								}
 								if (!ok) {
-									sockbuff.connected = false;
+									sockbuff_.connected = false;
 								}
 							}
 						}
@@ -668,7 +710,7 @@ public:
 							web_socket_upgraded = true;
 							WebSocket ws;
 							bool ws_ok = true;
-							while (sockbuff.connected && ws_ok) {
+							while (sockbuff_.connected && ws_ok) {
 								char buf[65536];
 								int n = read(connected_socket, buf, sizeof(buf));
 								if (n < 1) break;
@@ -699,9 +741,9 @@ public:
 												safe.push_back(static_cast<char>(ch));
 											}
 										}
-										printlog(strformat("ws recv %u bytes: %s").u(msg.payload.size()).s(safe).str());
+										printlog(fmt("ws recv %u bytes: %s")(msg.payload.size())(safe));
 										// Echo back the received message
-										printlog(strformat("ws sending echo (%u bytes)").u(msg.payload.size()).str());
+										printlog(fmt("ws sending echo (%u bytes)")(msg.payload.size()));
 										auto frame = WebSocket::make_frame(msg.opcode, msg.payload.data(), msg.payload.size());
 										if (!send_all(connected_socket, reinterpret_cast<char const *>(frame.data()), frame.size())) {
 											ws_ok = false;
@@ -718,15 +760,15 @@ public:
 							}
 							break;
 						}
-						if (request.content_length > 0 && !request.content_consumed && sockbuff.connected) {
+						if (request.content_length > 0 && !request.content_consumed && sockbuff_.connected) {
 							std::vector<char> discard;
 							size_t remaining = request.content_length;
-							while (remaining > 0 && sockbuff.connected) {
+							while (remaining > 0 && sockbuff_.connected) {
 								size_t to_read = std::min<size_t>(remaining, 65536);
 								discard.clear();
-								sockbuff.read(&discard, to_read);
+								sockbuff_.read(&discard, to_read);
 								if (discard.empty()) {
-									sockbuff.connected = false;
+									sockbuff_.connected = false;
 									break;
 								}
 								remaining -= discard.size();
@@ -860,6 +902,29 @@ bool HTTP_Server::http_send_response_header(socket_t sock, http_status_t const *
 	return send_all(sock, (char const *)&out[0], out.size());
 }
 
+void HTTP_Server::start()
+{
+	m->thread = std::thread([this]() {
+		run();
+	});
+}
+
+void HTTP_Server::join()
+{
+	if (m->thread.joinable()) {
+		m->thread.join();
+	}
+}
+
+void HTTP_Server::stop()
+{
+	join();
+	if (m->listening_socket != INVALID_SOCKET) {
+		closesocket(m->listening_socket);
+		m->listening_socket = INVALID_SOCKET;
+	}
+}
+
 bool HTTP_Server::run()
 {
 	try {
@@ -903,7 +968,7 @@ bool HTTP_Server::run()
 			throw std::string("listen");
 		}
 		
-		printlog(strformat("HTTP server listening on %s:%u").s(bind_addr).u(m->tcp_port).str());
+		printlog(fmt("HTTP server listening on %s:%u")(bind_addr)(m->tcp_port));
 
 #ifndef _WIN32
 		install_termination_handlers();
@@ -914,10 +979,7 @@ bool HTTP_Server::run()
 		int threadcount = 8;
 		threads.resize(threadcount);
 		for (int i = 0; i < threads.size(); i++) {
-			threads[i].setup(this);
-		}
-		for (int i = 0; i < threads.size(); i++) {
-			threads[i].start();
+			threads[i].start(this);
 		}
 
 		while (true) {
@@ -942,7 +1004,6 @@ bool HTTP_Server::run()
 
 		for (int i = 0; i < threads.size(); i++) {
 			threads[i].stop();
-			threads[i].join();
 		}
 	} catch (std::string const &e) {
 		printlog(std::string("http server error: ") + e);

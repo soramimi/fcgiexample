@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <thread>
 
 #ifndef _WIN32
 #define stricmp(A, B) strcasecmp(A, B)
@@ -138,7 +139,6 @@ class HTTP_Server {
 private:
 	struct Private;
 	Private *m;
-
 public:
 	HTTP_Server(HTTP_Handler *handler);
 	~HTTP_Server();
@@ -149,7 +149,12 @@ public:
 	http_status_t const *http_process_request(HTTP_Thread *thread, http_request_t *request, http_response_t *response, HTTPIO *io);
 	bool http_send_response_header(socket_t sock, http_status_t const *status, std::vector<std::string> const &response);
 
+	void start();
+	void join();
+	void stop();
+	
 	bool run();
+	
 };
 
 #endif
