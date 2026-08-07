@@ -1351,13 +1351,18 @@ public:
 		auto opt1 = tools.find_function(req.params.name);
 		if (opt1) {
 			mcp::AbstractTool *func = opt1.get();
-			mcp::McpRequest::Params::Argument const *arg_a = req.find_argument("a");
-			mcp::McpRequest::Params::Argument const *arg_b = req.find_argument("b");
+			assert(func);
 			std::vector<std::string> args;
-			args.push_back(arg_a ? arg_a->value : "0");
-			args.push_back(arg_b ? arg_b->value : "0");
-			auto opt2 = func->call({}, args);
-			std::string answer = opt2 ? *opt2 : "";
+			args.reserve(func->schema().input_properties.size());
+			for (mcp::Property const &prop : func->schema().input_properties) {
+				mcp::McpRequest::Params::Argument const *arg = req.find_argument(prop.name);
+				if (arg) {
+					args.push_back(arg->value);
+				} else {
+					args.push_back({});
+				}
+			}
+			mcp::Variant answer = func->call({}, args);
 			
 			jstream::Writer w;
 			w.enable_indent(false);
@@ -1369,11 +1374,11 @@ public:
 					w.array("content", [&](){
 						w.object({}, [&](){
 							w.string("type", "text");
-							w.string("text", answer);
+							w.string("text", answer.as_string());
 						});
 					});
 					w.object("structuredContent", [&](){
-						w.string("result", answer);
+						w.string("result", answer.as_string());
 					});
 					w.boolean("isError", false);
 				});
@@ -1502,13 +1507,13 @@ public:
 		add_argument("a", "A", "number");
 		add_argument("b", "B", "number");
 	}
-	std::optional<std::string> call(std::shared_ptr<void> context, std::vector<std::string> const &args) const
+	mcp::Variant call(std::shared_ptr<void> context, std::vector<std::string> const &args) const
 	{
-		if (args.size() != 2) return std::nullopt;
+		if (args.size() != 2) return {};
 		int a = toi<int>(args[0]);
 		int b = toi<int>(args[1]);
 		int ans = a + b;
-		return fmt("%d")(ans).str();
+		return (double)ans;
 	}
 };
 

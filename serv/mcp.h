@@ -6,6 +6,7 @@
 #include <optional>
 #include <misc/toi.h>
 #include <misc/fmt.h>
+#include <misc/jstream.h>
 #include <map>
 #include <memory>
 #include <variant>
@@ -123,17 +124,20 @@ public:
 	{
 		if (std::holds_alternative<double>(var_)) {
 			return std::get<double>(var_);
-		}
-		if (std::holds_alternative<std::string>(var_)) {
-			return toi<double>(std::get<std::string>(var_));
+		} else if (std::string const *s = std::get_if<std::string>(&var_)) {
+			return jstream::misc::my_strtod(s->c_str(), nullptr);
 		}
 		return 0;
 	}
-	std::string const &as_string() const
+	std::string as_string() const
 	{
-		return std::get<std::string>(var_);
+		if (std::holds_alternative<double>(var_)) {
+			return jstream::misc::format_double(std::get<double>(var_), false);
+		} else if (std::holds_alternative<std::string>(var_)) {
+			return std::get<std::string>(var_);
+		}
+		return {};
 	}
-	
 };
 
 class AbstractTool {
@@ -161,7 +165,7 @@ public:
 	{
 		schema_.input_properties.emplace_back(name, title, type);
 	}
-	virtual std::optional<std::string> call(std::shared_ptr<void> context, std::vector<std::string> const &args) const = 0;
+	virtual Variant call(std::shared_ptr<void> context, std::vector<std::string> const &args) const = 0;
 };
 
 class Tools {

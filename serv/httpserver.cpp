@@ -22,7 +22,6 @@
 #include <misc/joinpath.h>
 #include "misc.h"
 #include <misc/fmt.h>
-#include "thread.h"
 #include <algorithm>
 #include <limits>
 #include <map>

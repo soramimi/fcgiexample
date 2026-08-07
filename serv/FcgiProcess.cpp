@@ -6,7 +6,6 @@
 #include "event.h"
 #include "mutex.h"
 #include "socket.h"
-#include "thread.h"
 #include <deque>
 #include <vector>
 #ifndef _WIN32
